@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ft-shadow-data-plane"
+version = "0.1.0"
+description = "Loss-explicit Binance USD-M market data collection and reconstruction"
+readme = "README.md"
+license = { text = "GPL-3.0-only" }
+requires-python = ">=3.12"
+dependencies = [
+  "aiohttp>=3.11,<4",
+  "orjson>=3.10,<4",
+  "paramiko>=3.5,<5",
+  "pyarrow>=19,<22",
+  "pydantic>=2.10,<3",
+  "PyYAML>=6,<7",
+  "websockets>=15,<17",
+]
+
+[dependency-groups]
+dev = [
+  "mypy>=1.15,<2",
+  "pytest>=8.3,<10",
+  "pytest-asyncio>=0.25,<2",
+  "ruff>=0.9,<1",
+]
+
+[project.scripts]
+ft-data-edge = "ft_shadow_data_plane.edge.cli:main"
+ft-data-pull = "ft_shadow_data_plane.central.pull_cli:main"
+ft-data-process = "ft_shadow_data_plane.central.process_cli:main"
+ft-data-control = "ft_shadow_data_plane.central.control_cli:main"
+ft-data-release = "ft_shadow_data_plane.central.release_cli:main"
+ft-data-retain = "ft_shadow_data_plane.central.retention_cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ft_shadow_data_plane"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["A", "ASYNC", "B", "E", "F", "I", "PTH", "RUF", "UP", "W"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ft_shadow_data_plane"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+mypy_path = ["src"]
+
+[[tool.mypy.overrides]]
+module = ["paramiko", "paramiko.*", "pyarrow", "pyarrow.*", "yaml"]
+follow_imports = "skip"
+ignore_missing_imports = true

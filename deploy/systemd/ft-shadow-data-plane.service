@@ -1,0 +1,21 @@
+[Unit]
+Description=ft-shadow Binance USD-M edge collector
+Requires=docker.service
+After=docker.service network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+OnFailure=ft-shadow-data-plane-alert@%n.service
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/ft-shadow-data-plane/edge.env
+WorkingDirectory=/opt/ft-shadow-data-plane/deploy/edge
+ExecStart=/usr/bin/docker compose up --no-build --no-deps
+ExecStop=/usr/bin/docker compose stop --timeout 120
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=150
+
+[Install]
+WantedBy=multi-user.target

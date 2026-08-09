@@ -1,0 +1,97 @@
+# ft-shadow-data-plane
+
+Binance USD-M 公共行情数据平面。边缘采集器只保存 raw；中心节点完成校验、逻辑去重、
+L2 重建和质量账本。任何无法证明连续的数据都表示为 gap，不会被 REST 回填伪装成连续。
+
+实施合同见 [docs/implementation-plan.md](docs/implementation-plan.md)，部署前置与 canary 标准见
+[docs/deployment.md](docs/deployment.md)。旧 `ft-shadow` 仓库不是运行依赖。
+
+## 数据范围
+
+正式采集 `depth@100ms`、`bookTicker`、`aggTrade`、`markPrice@1s`、`forceOrder`、
+`contractInfo`、30 秒 OI，以及 L2 REST snapshot。全市场 `exchangeInfo` 和 24 小时 ticker
+每天低频采集，只用于生成 universe 决策，不作为微观结构证据。
+
+边缘最多接收 60 个 instrument。外部 selector 负责依据 discovery 数据决定成员，本仓库只负责
+验证和应用 versioned control。正常 DAILY control 必须在 `00:00 UTC` 生效；采集器若当时离线，
+会在恢复、启动 writer 前立即应用已经到期的最新 control。
+
+## 开发
+
+```bash
+uv sync --dev
+uv run pytest
+uv run ruff check .
+uv run mypy src
+```
+
+## 运行边缘采集器
+
+```bash
+cp config/edge.example.yaml config/edge.yaml
+uv run ft-data-edge --config config/edge.yaml
+```
+
+生产使用 `deploy/edge/compose.yaml` 和 systemd unit；容器内 `data_root` 必须为 `/data`。
+初始 1C1G、25GB SSD 只是 canary 候选，不是容量结论。
+
+## 更新 universe
+
+先生成 control，再通过受限 SFTP 账户把文件放入 edge 的
+`control/universe/inbox/*.control.json`：
+
+```bash
+uv run ft-data-control \
+  --generation 2 \
+  --effective-at 2026-08-11T00:00:00Z \
+  --reason daily \
+  --members BTCUSDT,ETHUSDT \
+  --output universe-2.control.json
+```
+
+DAILY 更新最多增删各 5 个成员，已有成员至少停留 48 小时。`new_listing_probe` 可以在日内
+增加观察位，但不能移除成员。无效 control 不会替换 last-known-good universe。
+
+## 中心单次拉取
+
+```bash
+cp config/central.example.yaml config/central.yaml
+uv run ft-data-pull --config config/central.yaml
+```
+
+该命令设计为由校园 login node 的 cron 每分钟调用一次。正式部署前必须获得管理员许可。
+
+## 中心处理
+
+只有 `SEALED.json` 声明的全部 chunk 都已下载并通过 hash 校验后，该 UTC 日才可处理：
+
+```bash
+uv run ft-data-process normalize \
+  --raw-root /persistent/ft-shadow-data-plane/raw \
+  --derived-root /persistent/ft-shadow-data-plane/derived \
+  --collector tokyo01 --date 2026-08-10
+
+uv run ft-data-process l2 \
+  --raw-root /persistent/ft-shadow-data-plane/raw \
+  --derived-root /persistent/ft-shadow-data-plane/derived \
+  --collector tokyo01 --date 2026-08-10 --symbol BTCUSDT
+```
+
+正式实验先用 `ft-data-release` pin 对应 `SEALED.json` hash。`ft-data-retain` 默认只 dry-run，
+显式增加 `--apply` 才删除超过 90 天且未被 release 引用的 raw 日。
+
+## 目录边界
+
+```text
+edge/ready/date=.../writer=.../         READY raw 与 sidecar
+edge/ready/day-manifests/date=.../      不可变 SEALED 日清单
+edge/control/                           ACK、universe 和未关闭 gap 状态
+
+central/raw/collector=.../date=.../     权威 raw
+central/raw/collector=.../day-manifests 完整性边界
+central/derived/typed/                  可由 raw 重建的 typed events
+central/derived/quality/                gap、clock 与 L2 validity
+```
+
+不要直接引用一个正在增长的目录作为实验数据集；实验引用边界是 collector、UTC date 和对应
+`SEALED.json` 的 SHA-256。

@@ -1,0 +1,9 @@
+host: collector.example.com
+port: 22
+username: data-puller
+client_key: /home/user/.ssh/ft-shadow-data-plane
+known_hosts: /home/user/.ssh/known_hosts
+remote_ready_root: ready
+remote_ack_root: control/acks
+local_raw_root: /persistent/ft-shadow-data-plane/raw
+connect_timeout_seconds: 20

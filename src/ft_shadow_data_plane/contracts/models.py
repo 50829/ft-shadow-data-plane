@@ -1,0 +1,358 @@
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from datetime import UTC, date, datetime
+from enum import StrEnum
+from pathlib import PurePosixPath
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{1,30}$")
+HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{8,160}$")
+
+
+class StreamType(StrEnum):
+    DEPTH = "depth"
+    RPI_DEPTH = "rpi_depth"
+    DEPTH_SNAPSHOT = "depth_snapshot"
+    RPI_DEPTH_SNAPSHOT = "rpi_depth_snapshot"
+    BOOK_TICKER = "book_ticker"
+    AGG_TRADE = "agg_trade"
+    TRADE = "trade"
+    MARK_PRICE = "mark_price"
+    FORCE_ORDER = "force_order"
+    CONTRACT_INFO = "contract_info"
+    OPEN_INTEREST = "open_interest"
+    EXCHANGE_INFO = "exchange_info"
+    MARKET_TICKERS = "market_tickers"
+    CLOCK_SAMPLE = "clock_sample"
+    WS_CONTROL = "ws_control"
+    UNKNOWN = "unknown"
+
+
+class WriterGroup(StrEnum):
+    DEPTH = "depth"
+    TRADES_MARKET = "trades_market"
+    METADATA = "metadata"
+    CONTROL = "control"
+
+
+class ContentType(StrEnum):
+    PARQUET = "application/vnd.apache.parquet"
+    GAP_JSON = "application/vnd.ft-shadow.gap+json"
+
+
+class GapReason(StrEnum):
+    INGEST_OVERLOAD = "INGEST_OVERLOAD_GAP"
+    STORAGE_EXHAUSTED = "STORAGE_EXHAUSTED_GAP"
+    CONNECTION_LOST = "CONNECTION_LOST_GAP"
+    L2_SEQUENCE = "L2_SEQUENCE_GAP"
+    PLANNED_BOUNDARY = "PLANNED_BOUNDARY_GAP"
+    COLLECTOR_STOPPED = "COLLECTOR_STOPPED_GAP"
+
+
+class GapState(StrEnum):
+    OPEN = "OPEN"
+    CLOSED = "CLOSED"
+
+
+class ControlReason(StrEnum):
+    DAILY = "daily"
+    NEW_LISTING_PROBE = "new_listing_probe"
+    BOOTSTRAP = "bootstrap"
+
+
+@dataclass(frozen=True, slots=True)
+class RawEventV1:
+    schema_version: int
+    exchange_symbol: str | None
+    stream_type: StreamType
+    collector_id: str
+    boot_id: str
+    segment_id: str
+    connection_id: str
+    receive_seq: int
+    app_receive_realtime_ns: int
+    app_receive_monotonic_ns: int
+    payload_bytes: bytes
+    request_id: str | None = None
+    request_realtime_ns: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise ValueError("RawEventV1 requires schema_version=1")
+        if self.exchange_symbol is not None and not SYMBOL_PATTERN.fullmatch(
+            self.exchange_symbol
+        ):
+            raise ValueError("invalid exchange_symbol")
+        if not self.collector_id or not self.boot_id or not self.segment_id:
+            raise ValueError("collector, boot, and segment identities are required")
+        if not self.connection_id:
+            raise ValueError("connection_id is required")
+        if self.receive_seq < 1:
+            raise ValueError("receive_seq must be positive")
+        if min(self.app_receive_realtime_ns, self.app_receive_monotonic_ns) < 0:
+            raise ValueError("receive timestamps cannot be negative")
+        if not self.payload_bytes:
+            raise ValueError("payload_bytes cannot be empty")
+        if (self.request_id is None) != (self.request_realtime_ns is None):
+            raise ValueError("REST request identity and timestamp must be supplied together")
+
+    @property
+    def approximate_size_bytes(self) -> int:
+        return len(self.payload_bytes) + 256
+
+    @property
+    def writer_group(self) -> WriterGroup:
+        if self.stream_type in {
+            StreamType.DEPTH,
+            StreamType.RPI_DEPTH,
+            StreamType.DEPTH_SNAPSHOT,
+            StreamType.RPI_DEPTH_SNAPSHOT,
+        }:
+            return WriterGroup.DEPTH
+        if self.stream_type in {
+            StreamType.BOOK_TICKER,
+            StreamType.AGG_TRADE,
+            StreamType.TRADE,
+            StreamType.MARK_PRICE,
+            StreamType.FORCE_ORDER,
+        }:
+            return WriterGroup.TRADES_MARKET
+        return WriterGroup.METADATA
+
+
+class FrozenModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class ChunkRefV1(FrozenModel):
+    chunk_id: str = Field(min_length=8, max_length=160)
+    data_path: str = Field(min_length=1, max_length=500)
+    sha256: str
+    size_bytes: int = Field(gt=0)
+    content_type: ContentType
+
+    @field_validator("chunk_id")
+    @classmethod
+    def validate_chunk_id(cls, value: str) -> str:
+        if not ID_PATTERN.fullmatch(value):
+            raise ValueError("chunk_id contains unsafe characters")
+        return value
+
+    @field_validator("sha256")
+    @classmethod
+    def validate_hash(cls, value: str) -> str:
+        if not HASH_PATTERN.fullmatch(value):
+            raise ValueError("sha256 must be lowercase hexadecimal")
+        return value
+
+    @field_validator("data_path")
+    @classmethod
+    def validate_path(cls, value: str) -> str:
+        path = PurePosixPath(value)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError("data_path must be a safe relative POSIX path")
+        return value
+
+
+class ChunkManifestV1(ChunkRefV1):
+    schema_version: Literal[1] = 1
+    collector_id: str = Field(min_length=1, max_length=100)
+    writer_group: WriterGroup
+    utc_date: date
+    event_count: int = Field(gt=0)
+    min_app_receive_realtime_ns: int = Field(ge=0)
+    max_app_receive_realtime_ns: int = Field(ge=0)
+    data_contract_hash: str
+    universe_hash: str
+    created_at: datetime
+
+    @field_validator("data_contract_hash", "universe_hash")
+    @classmethod
+    def validate_contract_hash(cls, value: str) -> str:
+        if not HASH_PATTERN.fullmatch(value):
+            raise ValueError("contract hashes must be lowercase SHA-256")
+        return value
+
+    @field_validator("created_at")
+    @classmethod
+    def require_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
+            raise ValueError("created_at must be UTC")
+        return value
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> ChunkManifestV1:
+        if self.max_app_receive_realtime_ns < self.min_app_receive_realtime_ns:
+            raise ValueError("chunk timestamp range is reversed")
+        return self
+
+    def as_ref(self) -> ChunkRefV1:
+        return ChunkRefV1.model_validate(
+            self.model_dump(
+                include={"chunk_id", "data_path", "sha256", "size_bytes", "content_type"}
+            )
+        )
+
+
+class AckV1(FrozenModel):
+    schema_version: Literal[1] = 1
+    chunk_id: str = Field(min_length=8, max_length=160)
+    sha256: str
+    durable_at: datetime
+
+    @field_validator("chunk_id")
+    @classmethod
+    def validate_chunk_id(cls, value: str) -> str:
+        if not ID_PATTERN.fullmatch(value):
+            raise ValueError("chunk_id contains unsafe characters")
+        return value
+
+    @field_validator("sha256")
+    @classmethod
+    def validate_hash(cls, value: str) -> str:
+        if not HASH_PATTERN.fullmatch(value):
+            raise ValueError("sha256 must be lowercase hexadecimal")
+        return value
+
+    @field_validator("durable_at")
+    @classmethod
+    def require_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
+            raise ValueError("durable_at must be UTC")
+        return value
+
+
+class DayManifestV1(FrozenModel):
+    schema_version: Literal[1] = 1
+    collector_id: str = Field(min_length=1, max_length=100)
+    utc_date: date
+    sealed_at: datetime
+    chunks: tuple[ChunkRefV1, ...]
+
+    @field_validator("sealed_at")
+    @classmethod
+    def require_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
+            raise ValueError("sealed_at must be UTC")
+        return value
+
+    @model_validator(mode="after")
+    def validate_unique_chunks(self) -> DayManifestV1:
+        identities = [(chunk.chunk_id, chunk.sha256) for chunk in self.chunks]
+        if len(identities) != len(set(identities)):
+            raise ValueError("day manifest contains duplicate chunk identities")
+        if self.sealed_at.date() <= self.utc_date:
+            raise ValueError("a UTC day cannot be sealed before it ends")
+        return self
+
+
+class GapEventV1(FrozenModel):
+    schema_version: Literal[1] = 1
+    gap_id: str = Field(min_length=8, max_length=160)
+    state: GapState
+    reason: GapReason
+    collector_id: str = Field(min_length=1, max_length=100)
+    connection_id: str | None = Field(default=None, max_length=160)
+    exchange_symbols: tuple[str, ...] = ()
+    stream_types: tuple[StreamType, ...] = ()
+    observed_at_realtime_ns: int = Field(ge=0)
+    detail: str = Field(default="", max_length=500)
+
+    @field_validator("exchange_symbols")
+    @classmethod
+    def validate_symbols(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not SYMBOL_PATTERN.fullmatch(value) for value in values):
+            raise ValueError("gap contains an invalid exchange symbol")
+        return values
+
+
+class UniverseControlV1(FrozenModel):
+    schema_version: Literal[1] = 1
+    generation: int = Field(ge=1)
+    created_at: datetime
+    effective_at: datetime
+    reason: ControlReason
+    members: tuple[str, ...] = Field(min_length=1, max_length=60)
+    universe_hash: str
+
+    @field_validator("created_at", "effective_at")
+    @classmethod
+    def require_utc(cls, value: datetime) -> datetime:
+        return ChunkManifestV1.require_utc(value)
+
+    @field_validator("members")
+    @classmethod
+    def validate_members(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(value.upper() for value in values)
+        if any(not SYMBOL_PATTERN.fullmatch(value) for value in normalized):
+            raise ValueError("control contains an invalid exchange symbol")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("control contains duplicate members")
+        if normalized != tuple(sorted(normalized)):
+            raise ValueError("control members must be sorted")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_schedule_and_hash(self) -> UniverseControlV1:
+        if self.effective_at < self.created_at:
+            raise ValueError("control cannot be effective before creation")
+        if self.reason is ControlReason.DAILY and any(
+            (
+                self.effective_at.hour,
+                self.effective_at.minute,
+                self.effective_at.second,
+                self.effective_at.microsecond,
+            )
+        ):
+            raise ValueError("daily control must become effective at 00:00 UTC")
+        from ft_shadow_data_plane.contracts.serde import universe_hash
+
+        if self.universe_hash != universe_hash(self.members):
+            raise ValueError("universe_hash does not match members")
+        return self
+
+
+class DayReleaseRefV1(FrozenModel):
+    collector_id: str = Field(min_length=1, max_length=100)
+    utc_date: date
+    sealed_manifest_sha256: str
+
+    @field_validator("sealed_manifest_sha256")
+    @classmethod
+    def validate_hash(cls, value: str) -> str:
+        if not HASH_PATTERN.fullmatch(value):
+            raise ValueError("sealed manifest hash must be lowercase SHA-256")
+        return value
+
+
+class DatasetReleaseV1(FrozenModel):
+    schema_version: Literal[1] = 1
+    release_id: str = Field(min_length=8, max_length=160)
+    created_at: datetime
+    days: tuple[DayReleaseRefV1, ...] = Field(min_length=1)
+
+    @field_validator("release_id")
+    @classmethod
+    def validate_release_id(cls, value: str) -> str:
+        if not ID_PATTERN.fullmatch(value):
+            raise ValueError("release_id contains unsafe characters")
+        return value
+
+    @field_validator("created_at")
+    @classmethod
+    def require_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
+            raise ValueError("created_at must be UTC")
+        return value
+
+    @model_validator(mode="after")
+    def validate_unique_days(self) -> DatasetReleaseV1:
+        identities = [(day.collector_id, day.utc_date) for day in self.days]
+        if len(identities) != len(set(identities)):
+            raise ValueError("release contains duplicate UTC days")
+        return self

@@ -1,0 +1,4 @@
+MAILTO=researcher@example.edu
+PATH=/usr/local/bin:/usr/bin:/bin
+
+* * * * * flock -n /persistent/ft-shadow-data-plane/pull.lock apptainer exec /persistent/ft-shadow-data-plane/ft-shadow-data-plane.sif ft-data-pull --config /persistent/ft-shadow-data-plane/central.yaml
