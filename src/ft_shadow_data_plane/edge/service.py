@@ -43,7 +43,7 @@ class EdgeService:
         )
         active = self._universe_store.initialize()
         active = self._universe_store.apply_due(
-            reasons=frozenset({ControlReason.DAILY})
+            reasons=frozenset({ControlReason.DAILY, ControlReason.CANARY_SCALE})
         ) or active
         data_contract_hash = data_contract_hash_v1(
             d0_enabled=config.d0_enabled,
@@ -201,7 +201,7 @@ class EdgeService:
                 await self._gaps.rollover(midnight)
                 control = self._universe_store.apply_due(
                     midnight,
-                    reasons=frozenset({ControlReason.DAILY}),
+                    reasons=frozenset({ControlReason.DAILY, ControlReason.CANARY_SCALE}),
                 )
                 active = control or self._universe_store.active
                 await self._ingest.rotate(universe_hash=active.universe_hash)

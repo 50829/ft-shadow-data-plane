@@ -32,6 +32,7 @@ ft-data-edge = "ft_shadow_data_plane.edge.cli:main"
 ft-data-pull = "ft_shadow_data_plane.central.pull_cli:main"
 ft-data-process = "ft_shadow_data_plane.central.process_cli:main"
 ft-data-control = "ft_shadow_data_plane.central.control_cli:main"
+ft-data-select = "ft_shadow_data_plane.central.select_cli:main"
 ft-data-release = "ft_shadow_data_plane.central.release_cli:main"
 ft-data-retain = "ft_shadow_data_plane.central.retention_cli:main"
 

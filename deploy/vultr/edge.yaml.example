@@ -1,8 +1,27 @@
 collector_id: tokyo01
 data_root: /data
 bootstrap_instruments:
+  # universe/bootstrap-2026-08-10T120017Z/stage-20.members.txt
+  - 1000PEPEUSDT
+  - ADAUSDT
+  - BEATUSDT
+  - BICOUSDT
+  - BMTUSDT
+  - BNBUSDT
   - BTCUSDT
+  - CYSUSDT
+  - DOGEUSDT
+  - EPICUSDT
   - ETHUSDT
+  - HYPEUSDT
+  - MUBARAKUSDT
+  - PUMPUSDT
+  - SOLUSDT
+  - TSTUSDT
+  - TUTUSDT
+  - WLDUSDT
+  - XRPUSDT
+  - ZECUSDT
 public_ws_url: wss://fstream.binance.com/public/stream
 market_ws_url: wss://fstream.binance.com/market/stream
 rest_url: https://fapi.binance.com

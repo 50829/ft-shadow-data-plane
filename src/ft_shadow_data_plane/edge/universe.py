@@ -6,7 +6,11 @@ from pathlib import Path
 
 import orjson
 
-from ft_shadow_data_plane.contracts.models import ControlReason, UniverseControlV1
+from ft_shadow_data_plane.contracts.models import (
+    CANARY_STAGE_SIZES,
+    ControlReason,
+    UniverseControlV1,
+)
 from ft_shadow_data_plane.contracts.serde import (
     atomic_write_bytes,
     canonical_json_bytes,
@@ -14,6 +18,8 @@ from ft_shadow_data_plane.contracts.serde import (
 )
 
 logger = logging.getLogger(__name__)
+
+NEW_LISTING_PROBE_SLOTS = 5
 
 
 class UniverseStore:
@@ -114,8 +120,22 @@ class UniverseStore:
             ]
             if too_young:
                 raise ValueError(f"daily control violates 48h dwell: {too_young}")
-        elif selected.reason is ControlReason.NEW_LISTING_PROBE and removed:
-            raise ValueError("new-listing probe control cannot remove existing members")
+        elif selected.reason is ControlReason.CANARY_SCALE:
+            if self.active.reason not in {ControlReason.BOOTSTRAP, ControlReason.CANARY_SCALE}:
+                raise ValueError("canary scale is only valid before daily operation")
+            if not current < proposed:
+                raise ValueError("canary scale must only add members")
+            next_sizes = [size for size in CANARY_STAGE_SIZES if size > len(current)]
+            if not next_sizes or len(proposed) != next_sizes[0]:
+                expected = next_sizes[0] if next_sizes else "none"
+                raise ValueError(f"next canary size must be {expected}")
+        elif selected.reason is ControlReason.NEW_LISTING_PROBE:
+            if self.active.reason in {ControlReason.BOOTSTRAP, ControlReason.CANARY_SCALE}:
+                raise ValueError("new-listing probes are disabled until daily operation")
+            if removed:
+                raise ValueError("new-listing probe control cannot remove existing members")
+            if len(added) > NEW_LISTING_PROBE_SLOTS:
+                raise ValueError("new-listing probe control may add at most five members")
 
     def _load_or_initialize_membership(self) -> None:
         if self._membership_path.exists():

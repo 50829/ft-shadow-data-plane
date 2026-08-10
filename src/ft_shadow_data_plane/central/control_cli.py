@@ -19,15 +19,26 @@ def main() -> None:
     parser.add_argument(
         "--reason",
         type=ControlReason,
-        choices=(ControlReason.DAILY, ControlReason.NEW_LISTING_PROBE),
+        choices=(
+            ControlReason.DAILY,
+            ControlReason.CANARY_SCALE,
+            ControlReason.NEW_LISTING_PROBE,
+        ),
         required=True,
     )
-    parser.add_argument("--members", required=True, help="comma-separated Binance symbols")
+    members_group = parser.add_mutually_exclusive_group(required=True)
+    members_group.add_argument("--members", help="comma-separated Binance symbols")
+    members_group.add_argument(
+        "--members-file", type=Path, help="one Binance symbol per line"
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    members = tuple(
-        sorted(set(value.strip().upper() for value in args.members.split(",") if value))
+    raw_members = (
+        args.members.split(",")
+        if args.members is not None
+        else args.members_file.read_text(encoding="ascii").splitlines()
     )
+    members = tuple(sorted(value.strip().upper() for value in raw_members if value.strip()))
     control = UniverseControlV1(
         generation=args.generation,
         created_at=datetime.now(UTC),

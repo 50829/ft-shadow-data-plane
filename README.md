@@ -21,9 +21,9 @@ L2 重建和质量账本。任何无法证明连续的数据都表示为 gap，�
 `contractInfo`、30 秒 OI，以及 L2 REST snapshot。全市场 `exchangeInfo` 和 24 小时 ticker
 每天低频采集，只用于生成 universe 决策，不作为微观结构证据。
 
-边缘最多接收 60 个 instrument。外部 selector 负责依据 discovery 数据决定成员，本仓库只负责
-验证和应用 versioned control。正常 DAILY control 必须在 `00:00 UTC` 生效；采集器若当时离线，
-会在恢复、启动 writer 前立即应用已经到期的最新 control。
+边缘最多接收 60 个 instrument。校园端 selector 依据 discovery 数据生成可审计的成员决策，
+边缘只验证和应用 versioned control。正常 DAILY 和 CANARY_SCALE control 必须在
+`00:00 UTC` 生效；采集器若当时离线，会在恢复、启动 writer 前立即应用已经到期的最新 control。
 
 ## 开发
 
@@ -44,6 +44,28 @@ uv run ft-data-edge --config /tmp/edge.yaml
 
 生产部署从 [`deploy/vultr/README.md`](deploy/vultr/README.md) 开始；容器内 `data_root`
 必须为 `/data`。初始 1C1G、25GB SSD 只是 canary 候选，不是容量结论。
+
+## 首次 universe 与 canary
+
+首次固定名单及原始 Binance discovery 快照位于
+[`universe/bootstrap-2026-08-10T120017Z`](universe/bootstrap-2026-08-10T120017Z)。该名单固定
+50 个 core、5 个 boundary 和 5 个最新上市 probe，并生成嵌套的 20、40、50、60 阶段。
+Vultr 示例配置从 stage 20 启动。
+
+完成一个阶段的验收后，为下一阶段生成 control：
+
+```bash
+uv run ft-data-control \
+  --generation 2 \
+  --effective-at 2026-08-12T00:00:00Z \
+  --reason canary_scale \
+  --members-file universe/bootstrap-2026-08-10T120017Z/stage-40.members.txt \
+  --output universe-2.control.json
+```
+
+`CANARY_SCALE` 只允许按 `20 -> 40 -> 50 -> 60` 增加嵌套成员，不能在进入 DAILY 后使用。
+stage 60 连续通过 72 小时后，使用一次 DAILY control 切换到同 bundle 的
+`steady-55.members.txt`，释放 5 个新上市观察位。
 
 ## 更新 universe
 

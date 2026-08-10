@@ -37,7 +37,9 @@ sudo ./deploy/vultr/install.sh
 
 把 `EDGE_IMAGE` 设置为 `edge-image.txt` 中完整的 `ghcr.io/...@sha256:...` 地址。
 `edge.yaml` 中保持 `data_root: /data`；Compose 会把它映射到主机的
-`/srv/ft-data-sftp`。根据需要修改初始交易对和告警邮箱。
+`/srv/ft-data-sftp`。仓库中的示例已经固定为
+`universe/bootstrap-2026-08-10T120017Z/stage-20.members.txt` 对应的首次 canary 名单；不要在
+部署时重新排名。根据需要修改告警邮箱。
 
 ## 4. 限制 SFTP
 

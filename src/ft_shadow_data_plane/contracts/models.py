@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{1,30}$")
 HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{8,160}$")
+CANARY_STAGE_SIZES = (20, 40, 50, 60)
 
 
 class StreamType(StrEnum):
@@ -61,6 +62,7 @@ class GapState(StrEnum):
 
 class ControlReason(StrEnum):
     DAILY = "daily"
+    CANARY_SCALE = "canary_scale"
     NEW_LISTING_PROBE = "new_listing_probe"
     BOOTSTRAP = "bootstrap"
 
@@ -301,7 +303,7 @@ class UniverseControlV1(FrozenModel):
     def validate_schedule_and_hash(self) -> UniverseControlV1:
         if self.effective_at < self.created_at:
             raise ValueError("control cannot be effective before creation")
-        if self.reason is ControlReason.DAILY and any(
+        if self.reason in {ControlReason.DAILY, ControlReason.CANARY_SCALE} and any(
             (
                 self.effective_at.hour,
                 self.effective_at.minute,
@@ -309,7 +311,7 @@ class UniverseControlV1(FrozenModel):
                 self.effective_at.microsecond,
             )
         ):
-            raise ValueError("daily control must become effective at 00:00 UTC")
+            raise ValueError("daily and canary controls must become effective at 00:00 UTC")
         from ft_shadow_data_plane.contracts.serde import universe_hash
 
         if self.universe_hash != universe_hash(self.members):

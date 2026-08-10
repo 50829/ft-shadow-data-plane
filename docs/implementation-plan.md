@@ -19,7 +19,7 @@ Experiment 使用已验证的数据生成特征和模型
 
 - `contracts`：raw、manifest、gap 和 control 数据契约；
 - `edge`：公共行情采集、分块落盘、spool 和 SFTP 发布目录；
-- `central`：SFTP 拉取、完整性验证、typed events、L2 校验和 quality ledger。
+- `central`：SFTP 拉取、universe selector、完整性验证、typed events、L2 校验和 quality ledger。
 
 旧 `ft-shadow` 的代码和数据不迁移，也不作为运行依赖。实验特征、标签、回测、模型和
 交易执行不属于本仓库。
@@ -45,6 +45,15 @@ D0 临时双收一个完整 UTC 日的 `trade/aggTrade` 和普通/RPI depth，�
 中心固定 40–50 个正式实验成员，边缘采集池上限 60，并保留少量排名边界和新上市观察
 位置。正常 universe 更新在每天 `00:00 UTC` 生效，最多替换 5 个，成员最短停留 48 小时；
 新上市合约可立即进入专用观察位。全市场 discovery 数据不作为微观结构实验数据。
+
+首次 selector 固定 50 个 core、5 个 boundary 和 5 个最新 probe，并从同一决策生成嵌套的
+20、40、50、60 canary 名单。`CANARY_SCALE` 只允许按这些阶段增加成员；DAILY 的 5 个变更
+限制只在 canary 完成后的稳态运行使用。每次 selector 决策必须保存原始 discovery hash、
+规则、排名、排除原因和最终 universe hash。
+
+60-instrument final canary 通过 72 小时后，首次 DAILY control 移除 5 个 canary probe，进入
+50 core + 5 boundary 的 steady pool；由此预留的 5 个空位才允许日内 `new_listing_probe`
+逐个增加。canary 期间禁止使用 `new_listing_probe`。
 
 ## 3. RawEventV1
 

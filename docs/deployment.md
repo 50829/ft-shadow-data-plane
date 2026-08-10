@@ -28,12 +28,18 @@ Slurm 的 normalize、L2 array 和 finalize 依赖关系由校园部署目录中
 
 ## Canary
 
-按 20、40、50、60 instruments 每级至少运行 24 小时，最后一级运行 72 小时。依据日志
+使用同一个 bootstrap decision 的嵌套 stage 文件，按 20、40、50、60 instruments 每级至少
+运行 24 小时，最后一级运行 72 小时。阶段间通过 `canary_scale` control 在 `00:00 UTC`
+生效，不使用 DAILY 或 `new_listing_probe` 绕过约束。依据日志
 检查 CPU、CPU steal、RSS、Arrow allocator、queue、event-loop lag、compressed bytes 和
 finalize latency。只有下式能在 25GB SSD 的可用空间内成立时才接受该磁盘：
 
 ```text
 required_spool = 1.5 * max_rolling_6h_compressed_bytes
 ```
+
+final stage 连续运行 72 小时并通过验收后，使用 bundle 中的 `steady-55.members.txt` 生成
+DAILY control；该变更一次移除 5 个 probe，且它们已经满足 48 小时最短停留要求。此后才
+允许通过 `new_listing_probe` 使用预留的 5 个空位。
 
 1C1G 失败则升级到 2C2G；磁盘失败则扩盘，不通过降低数据保真度过关。
