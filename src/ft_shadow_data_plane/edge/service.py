@@ -11,7 +11,7 @@ from uuid import uuid4
 
 import pyarrow as pa
 
-from ft_shadow_data_plane.contracts.data_contract import DATA_CONTRACT_HASH_V1
+from ft_shadow_data_plane.contracts.data_contract import data_contract_hash_v1
 from ft_shadow_data_plane.contracts.models import ControlReason, GapEventV1, GapReason
 from ft_shadow_data_plane.edge.config import EdgeConfig
 from ft_shadow_data_plane.edge.day_index import DayIndex
@@ -45,6 +45,10 @@ class EdgeService:
         active = self._universe_store.apply_due(
             reasons=frozenset({ControlReason.DAILY})
         ) or active
+        data_contract_hash = data_contract_hash_v1(
+            d0_enabled=config.d0_enabled,
+            open_interest_interval_seconds=config.open_interest_interval_seconds,
+        )
         self._day_index = DayIndex(config.data_root, config.collector_id)
         self._queues = ByteBoundedQueues(
             config.queue_max_bytes,
@@ -54,7 +58,7 @@ class EdgeService:
         self._writers = WriterPool(
             config.data_root,
             collector_id=config.collector_id,
-            data_contract_hash=DATA_CONTRACT_HASH_V1,
+            data_contract_hash=data_contract_hash,
             universe_hash=active.universe_hash,
             queues=self._queues,
             day_index=self._day_index,
@@ -70,7 +74,7 @@ class EdgeService:
         self._gaps = GapJournal(
             config.data_root,
             collector_id=config.collector_id,
-            data_contract_hash=DATA_CONTRACT_HASH_V1,
+            data_contract_hash=data_contract_hash,
             universe_hash=active.universe_hash,
             day_index=self._day_index,
         )
@@ -101,7 +105,7 @@ class EdgeService:
         self._quarantine_incomplete_chunks()
         self._writers.start()
         try:
-            if not self._spool.status().hard_limited:
+            if not (await asyncio.to_thread(self._spool.status)).hard_limited:
                 await self._sources.start(self._universe_store.active.members)
                 await self._sources.wait_ready()
                 await self._close_stale_gaps()
@@ -150,8 +154,8 @@ class EdgeService:
         while not self._stop.is_set():
             async with self._operation_lock:
                 self._sources.raise_if_failed()
-                removed = self._spool.apply_acks()
-                status = self._spool.status()
+                removed = await asyncio.to_thread(self._spool.apply_acks)
+                status = await asyncio.to_thread(self._spool.status)
                 if removed:
                     logger.info("garbage-collected ACKed chunks count=%d", removed)
                 if status.hard_limited and self._storage_gap_id is None:
@@ -203,7 +207,8 @@ class EdgeService:
                 await self._ingest.rotate(universe_hash=active.universe_hash)
                 self._gaps.set_universe_hash(active.universe_hash)
                 await self._day_index.seal(previous_date, sealed_at=midnight)
-                if was_running and not self._spool.status().hard_limited:
+                status = await asyncio.to_thread(self._spool.status)
+                if was_running and not status.hard_limited:
                     await self._sources.start(active.members)
                     await self._sources.wait_ready()
                 await self._gaps.close(
@@ -229,7 +234,8 @@ class EdgeService:
                     await self._sources.stop()
                     await self._ingest.rotate(universe_hash=control.universe_hash)
                     self._gaps.set_universe_hash(control.universe_hash)
-                    if was_running and not self._spool.status().hard_limited:
+                    status = await asyncio.to_thread(self._spool.status)
+                    if was_running and not status.hard_limited:
                         await self._sources.start(control.members)
                         await self._sources.wait_ready()
                     await self._gaps.close(
@@ -244,7 +250,7 @@ class EdgeService:
         loop = asyncio.get_running_loop()
         previous_tick = loop.time()
         while not self._stop.is_set():
-            status = self._spool.status()
+            status = await asyncio.to_thread(self._spool.status)
             usage = resource.getrusage(resource.RUSAGE_SELF)
             current_cpu = _host_cpu_sample()
             steal_ratio = _steal_ratio(self._previous_cpu, current_cpu)

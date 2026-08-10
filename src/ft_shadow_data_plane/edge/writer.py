@@ -97,10 +97,7 @@ class ChunkSession:
             write_statistics=True,
         )
 
-    def should_rotate_before(self, event: RawEventV1) -> bool:
-        event_date = datetime.fromtimestamp(
-            event.app_receive_realtime_ns // 1_000_000_000, tz=UTC
-        ).date()
+    def should_rotate_before(self, event: RawEventV1, event_date: date) -> bool:
         if event_date != self.utc_date:
             return True
         if self.event_count == 0:
@@ -302,7 +299,7 @@ class WriterPool:
                 event_date = datetime.fromtimestamp(
                     item.event.app_receive_realtime_ns // 1_000_000_000, tz=UTC
                 ).date()
-                if session is not None and session.should_rotate_before(item.event):
+                if session is not None and session.should_rotate_before(item.event, event_date):
                     await finish()
                 if session is None:
                     session = ChunkSession(

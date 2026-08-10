@@ -5,6 +5,7 @@ import pytest
 
 from ft_shadow_data_plane.central.binance import parse_typed_row
 from ft_shadow_data_plane.contracts.models import StreamType
+from ft_shadow_data_plane.edge.binance import SourceIdentity, decode_websocket
 
 
 @pytest.mark.parametrize(
@@ -116,3 +117,48 @@ def test_market_wide_payload_is_valid_discovery_evidence(
             "payload_bytes": orjson.dumps(payload),
         }
     ) is None
+
+
+def test_edge_depth_decode_reuses_parsed_sequence_fields() -> None:
+    decoded = decode_websocket(
+        orjson.dumps(
+            {
+                "stream": "btcusdt@depth@100ms",
+                "data": {
+                    "e": "depthUpdate",
+                    "s": "BTCUSDT",
+                    "U": 10,
+                    "u": 11,
+                    "pu": 9,
+                    "b": [],
+                    "a": [],
+                },
+            }
+        )
+    )
+
+    assert decoded.stream_type is StreamType.DEPTH
+    assert decoded.symbol == "BTCUSDT"
+    assert decoded.data is not None
+    assert (decoded.data["pu"], decoded.data["u"]) == (9, 11)
+
+
+def test_source_identity_assigns_sequence_without_async_scheduling() -> None:
+    identity = SourceIdentity("tokyo01", "boot", "segment", "connection")
+
+    first = identity.event(
+        stream_type=StreamType.AGG_TRADE,
+        exchange_symbol="BTCUSDT",
+        payload=b"{}",
+        realtime_ns=1,
+        monotonic_ns=1,
+    )
+    second = identity.event(
+        stream_type=StreamType.AGG_TRADE,
+        exchange_symbol="BTCUSDT",
+        payload=b"{}",
+        realtime_ns=2,
+        monotonic_ns=2,
+    )
+
+    assert (first.receive_seq, second.receive_seq) == (1, 2)

@@ -4,7 +4,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
@@ -18,19 +18,27 @@ from ft_shadow_data_plane.edge.ingest import IngestCoordinator
 logger = logging.getLogger(__name__)
 
 
-def classify_websocket(raw: bytes) -> tuple[StreamType, str | None]:
+@dataclass(frozen=True, slots=True)
+class DecodedWebSocket:
+    stream_type: StreamType
+    symbol: str | None
+    message: dict[str, Any] | None
+    data: dict[str, Any] | None
+
+
+def decode_websocket(raw: bytes) -> DecodedWebSocket:
     try:
         message = orjson.loads(raw)
     except orjson.JSONDecodeError:
-        return StreamType.UNKNOWN, None
+        return DecodedWebSocket(StreamType.UNKNOWN, None, None, None)
     if not isinstance(message, dict):
-        return StreamType.UNKNOWN, None
+        return DecodedWebSocket(StreamType.UNKNOWN, None, None, None)
     if "result" in message or ("id" in message and "data" not in message):
-        return StreamType.WS_CONTROL, None
+        return DecodedWebSocket(StreamType.WS_CONTROL, None, message, None)
     stream = str(message.get("stream", "")).lower()
     data = message.get("data", message)
     if not isinstance(data, dict):
-        return StreamType.UNKNOWN, None
+        return DecodedWebSocket(StreamType.UNKNOWN, None, message, None)
     event_type = str(data.get("e", ""))
     symbol_value = data.get("s")
     if event_type == "forceOrder" and isinstance(data.get("o"), dict):
@@ -38,10 +46,8 @@ def classify_websocket(raw: bytes) -> tuple[StreamType, str | None]:
     symbol = str(symbol_value).upper() if symbol_value else None
 
     if event_type == "depthUpdate":
-        return (
-            StreamType.RPI_DEPTH if "@rpidepth@" in stream else StreamType.DEPTH,
-            symbol,
-        )
+        stream_type = StreamType.RPI_DEPTH if "@rpidepth@" in stream else StreamType.DEPTH
+        return DecodedWebSocket(stream_type, symbol, message, data)
     mapping = {
         "bookTicker": StreamType.BOOK_TICKER,
         "aggTrade": StreamType.AGG_TRADE,
@@ -50,7 +56,9 @@ def classify_websocket(raw: bytes) -> tuple[StreamType, str | None]:
         "forceOrder": StreamType.FORCE_ORDER,
         "contractInfo": StreamType.CONTRACT_INFO,
     }
-    return mapping.get(event_type, StreamType.UNKNOWN), symbol
+    return DecodedWebSocket(
+        mapping.get(event_type, StreamType.UNKNOWN), symbol, message, data
+    )
 
 
 @dataclass(slots=True)
@@ -60,9 +68,8 @@ class SourceIdentity:
     segment_id: str
     connection_id: str
     _sequence: int = 0
-    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-    async def event(
+    def event(
         self,
         *,
         stream_type: StreamType,
@@ -73,9 +80,7 @@ class SourceIdentity:
         request_id: str | None = None,
         request_realtime_ns: int | None = None,
     ) -> RawEventV1:
-        async with self._lock:
-            self._sequence += 1
-            sequence = self._sequence
+        self._sequence += 1
         return RawEventV1(
             schema_version=1,
             exchange_symbol=exchange_symbol,
@@ -84,7 +89,7 @@ class SourceIdentity:
             boot_id=self.boot_id,
             segment_id=self.segment_id,
             connection_id=self.connection_id,
-            receive_seq=sequence,
+            receive_seq=self._sequence,
             app_receive_realtime_ns=realtime_ns,
             app_receive_monotonic_ns=monotonic_ns,
             payload_bytes=payload,
@@ -188,17 +193,17 @@ class BinanceWebSocketConnection:
                     monotonic_ns = time.monotonic_ns()
                     if not isinstance(raw, bytes):
                         raw = raw.encode()
-                    stream_type, symbol = classify_websocket(raw)
-                    event = await self._identity.event(
-                        stream_type=stream_type,
-                        exchange_symbol=symbol,
+                    decoded = decode_websocket(raw)
+                    event = self._identity.event(
+                        stream_type=decoded.stream_type,
+                        exchange_symbol=decoded.symbol,
                         payload=raw,
                         realtime_ns=realtime_ns,
                         monotonic_ns=monotonic_ns,
                     )
                     await self._ingest.put(event)
-                    if stream_type is StreamType.WS_CONTROL and _is_subscription_ack(
-                        raw, subscription_id
+                    if decoded.stream_type is StreamType.WS_CONTROL and _is_subscription_ack(
+                        decoded.message, subscription_id
                     ):
                         if self._snapshot_requests:
                             snapshot_task = asyncio.create_task(
@@ -211,8 +216,14 @@ class BinanceWebSocketConnection:
                         await snapshot_task
                         snapshot_task = None
                         self._ready.set()
-                    if stream_type in {StreamType.DEPTH, StreamType.RPI_DEPTH} and symbol:
-                        await self._check_depth_sequence(stream_type, symbol, raw)
+                    if (
+                        decoded.stream_type in {StreamType.DEPTH, StreamType.RPI_DEPTH}
+                        and decoded.symbol
+                        and decoded.data is not None
+                    ):
+                        await self._check_depth_sequence(
+                            decoded.stream_type, decoded.symbol, decoded.data
+                        )
                     for key, task in tuple(self._resync_tasks.items()):
                         if task.done():
                             await task
@@ -238,7 +249,7 @@ class BinanceWebSocketConnection:
                 payload, requested_at, observed_at, request_id = (
                     await self._rest.fetch_snapshot(path, symbol=symbol)
                 )
-                event = await self._identity.event(
+                event = self._identity.event(
                     stream_type=stream_type,
                     exchange_symbol=symbol,
                     payload=payload,
@@ -256,12 +267,8 @@ class BinanceWebSocketConnection:
                 delay = min(delay * 2, 10)
 
     async def _check_depth_sequence(
-        self, stream_type: StreamType, symbol: str, raw: bytes
+        self, stream_type: StreamType, symbol: str, data: dict[str, Any]
     ) -> None:
-        message = _json_object(raw)
-        data = message.get("data", message)
-        if not isinstance(data, dict):
-            raise ValueError("depth data must be an object")
         previous = int(data["pu"])
         final = int(data["u"])
         key = (stream_type, symbol)
@@ -321,20 +328,9 @@ def shard_instruments(instruments: tuple[str, ...], count: int) -> tuple[tuple[s
     return tuple(tuple(shard) for shard in shards)
 
 
-def _is_subscription_ack(raw: bytes, expected_id: int) -> bool:
-    try:
-        value: Any = orjson.loads(raw)
-    except orjson.JSONDecodeError:
-        return False
+def _is_subscription_ack(value: dict[str, Any] | None, expected_id: int) -> bool:
     return (
         isinstance(value, dict)
         and value.get("id") == expected_id
         and value.get("result") is None
     )
-
-
-def _json_object(raw: bytes) -> dict[str, Any]:
-    value = orjson.loads(raw)
-    if not isinstance(value, dict):
-        raise ValueError("Binance payload must be an object")
-    return value

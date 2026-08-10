@@ -53,6 +53,7 @@ class RouteRunner:
         rotation_seconds: int,
         overlap_seconds: int,
         service_stop: asyncio.Event,
+        rotation_offset_seconds: float = 0,
         d0_enabled: bool = False,
         on_ready: Callable[[str], None] | None = None,
     ) -> None:
@@ -68,6 +69,7 @@ class RouteRunner:
         self._gaps = gaps
         self._rest = rest
         self._rotation_seconds = rotation_seconds
+        self._next_rotation_seconds = rotation_seconds + rotation_offset_seconds
         self._overlap_seconds = overlap_seconds
         self._service_stop = service_stop
         self._d0_enabled = d0_enabled
@@ -237,7 +239,7 @@ class RouteRunner:
         )
 
     async def _wait_current(self, handle: ConnectionHandle) -> str:
-        rotation = asyncio.create_task(asyncio.sleep(self._rotation_seconds))
+        rotation = asyncio.create_task(asyncio.sleep(self._next_rotation_seconds))
         stopping = asyncio.create_task(self._service_stop.wait())
         done, pending = await asyncio.wait(
             (handle.task, rotation, stopping), return_when=asyncio.FIRST_COMPLETED
@@ -249,6 +251,7 @@ class RouteRunner:
             return "stop"
         if handle.task in done:
             return "failed"
+        self._next_rotation_seconds = self._rotation_seconds
         return "rotate"
 
     async def _open_gap(
@@ -305,19 +308,43 @@ class RestPollers:
         )
 
     async def _open_interest_loop(self) -> None:
+        ready_symbols: set[str] = set()
+        interval = self._config.open_interest_interval_seconds
+        instrument_count = len(self._instruments)
+        await asyncio.gather(
+            *(
+                self._open_interest_symbol_loop(
+                    symbol,
+                    ready_symbols,
+                    initial_delay=index * interval / instrument_count,
+                )
+                for index, symbol in enumerate(self._instruments)
+            )
+        )
+
+    async def _open_interest_symbol_loop(
+        self, symbol: str, ready_symbols: set[str], *, initial_delay: float
+    ) -> None:
         gap: tuple[str, GapReason] | None = None
         streams = (StreamType.OPEN_INTEREST,)
+        symbols = (symbol,)
+        interval = self._config.open_interest_interval_seconds
+        next_poll = time.monotonic() + initial_delay
         while not self._stop.is_set():
+            await _wait_event(self._stop, max(0.0, next_poll - time.monotonic()))
+            if self._stop.is_set():
+                return
             try:
-                await asyncio.gather(*(self._fetch_oi(symbol) for symbol in self._instruments))
-                gap = await self._close_poll_gap(gap, self._instruments, streams)
-                self._on_ready("open_interest")
-                await _wait_event(self._stop, self._config.open_interest_interval_seconds)
+                await self._fetch_oi(symbol)
+                gap = await self._close_poll_gap(gap, symbols, streams)
+                ready_symbols.add(symbol)
+                if len(ready_symbols) == len(self._instruments):
+                    self._on_ready("open_interest")
             except QueueOverloaded as exc:
                 gap = await self._open_poll_gap(
                     gap,
                     GapReason.INGEST_OVERLOAD,
-                    self._instruments,
+                    symbols,
                     streams,
                     str(exc),
                 )
@@ -326,18 +353,19 @@ class RestPollers:
                 gap = await self._open_poll_gap(
                     gap,
                     GapReason.CONNECTION_LOST,
-                    self._instruments,
+                    symbols,
                     streams,
                     str(exc),
                 )
-                logger.warning("open-interest poll failed error=%s", exc)
-                await _wait_event(self._stop, 5)
+                logger.warning("open-interest poll failed symbol=%s error=%s", symbol, exc)
+            finally:
+                next_poll = _advance_deadline(next_poll, interval, time.monotonic())
 
     async def _fetch_oi(self, symbol: str) -> None:
         payload, requested_at, observed_at, request_id = await self._rest.fetch(
             "/fapi/v1/openInterest", params={"symbol": symbol}
         )
-        event = await self._oi_identity.event(
+        event = self._oi_identity.event(
             stream_type=StreamType.OPEN_INTEREST,
             exchange_symbol=symbol,
             payload=payload,
@@ -358,7 +386,7 @@ class RestPollers:
                     ("/fapi/v1/ticker/24hr", StreamType.MARKET_TICKERS),
                 ):
                     payload, requested_at, observed_at, request_id = await self._rest.fetch(path)
-                    event = await self._discovery_identity.event(
+                    event = self._discovery_identity.event(
                         stream_type=stream_type,
                         exchange_symbol=None,
                         payload=payload,
@@ -391,7 +419,7 @@ class RestPollers:
                 payload, requested_at, observed_at, request_id = await self._rest.fetch(
                     "/fapi/v1/time"
                 )
-                event = await self._discovery_identity.event(
+                event = self._discovery_identity.event(
                     stream_type=StreamType.CLOCK_SAMPLE,
                     exchange_symbol=None,
                     payload=payload,
@@ -549,6 +577,14 @@ class SourceManager:
                     ready.set()
 
             for index, shard in enumerate(shards):
+                public_stream_types = [StreamType.BOOK_TICKER, StreamType.DEPTH]
+                if self._config.d0_enabled:
+                    public_stream_types.extend((StreamType.TRADE, StreamType.RPI_DEPTH))
+                snapshot_count = len(shard) * (2 if self._config.d0_enabled else 1)
+                rotation_offset = index * (
+                    snapshot_count * self._config.snapshot_request_interval_seconds
+                    + self._config.connection_overlap_seconds
+                )
                 routes.append(
                     RouteRunner(
                         name=f"public-{index}",
@@ -557,7 +593,7 @@ class SourceManager:
                             shard, d0_enabled=self._config.d0_enabled
                         ),
                         instruments=shard,
-                        stream_types=(StreamType.BOOK_TICKER, StreamType.DEPTH),
+                        stream_types=tuple(public_stream_types),
                         collector_id=self._collector_id,
                         boot_id=self._boot_id,
                         ingest=self._ingest,
@@ -565,6 +601,7 @@ class SourceManager:
                         gaps=self._gaps,
                         rest=rest,
                         rotation_seconds=self._config.connection_rotation_seconds,
+                        rotation_offset_seconds=rotation_offset,
                         overlap_seconds=self._config.connection_overlap_seconds,
                         service_stop=stop,
                         d0_enabled=self._config.d0_enabled,
@@ -628,3 +665,11 @@ async def _wait_event(event: asyncio.Event, delay_seconds: float) -> None:
         await asyncio.wait_for(event.wait(), timeout=delay_seconds)
     except TimeoutError:
         pass
+
+
+def _advance_deadline(previous: float, interval: float, now: float) -> float:
+    deadline = previous + interval
+    if deadline <= now:
+        missed = int((now - deadline) // interval) + 1
+        deadline += missed * interval
+    return deadline

@@ -1,18 +1,48 @@
 from __future__ import annotations
 
-from ft_shadow_data_plane.contracts.serde import sha256_bytes
+from typing import Any
 
-DATA_CONTRACT_V1 = b"""{
-  "exchange":"binance_usdm",
-  "raw_schema":1,
-  "streams":[
-    "agg_trade","book_ticker","clock_sample","contract_info","depth","depth_snapshot",
-    "exchange_info","force_order","mark_price","market_tickers","open_interest"
-  ],
-  "depth_interval_ms":100,
-  "depth_snapshot_limit":1000,
-  "mark_price_interval_ms":1000,
-  "open_interest_interval_seconds":30
-}\n"""
+from ft_shadow_data_plane.contracts.serde import canonical_json_bytes, sha256_bytes
 
-DATA_CONTRACT_HASH_V1 = sha256_bytes(DATA_CONTRACT_V1)
+FORMAL_STREAMS_V1 = (
+    "agg_trade",
+    "book_ticker",
+    "clock_sample",
+    "contract_info",
+    "depth",
+    "depth_snapshot",
+    "exchange_info",
+    "force_order",
+    "mark_price",
+    "market_tickers",
+    "open_interest",
+)
+D0_STREAMS_V1 = ("rpi_depth", "rpi_depth_snapshot", "trade")
+
+
+def data_contract_v1(
+    *, d0_enabled: bool = False, open_interest_interval_seconds: int = 30
+) -> bytes:
+    streams = FORMAL_STREAMS_V1 + (D0_STREAMS_V1 if d0_enabled else ())
+    payload: dict[str, Any] = {
+        "depth_interval_ms": 100,
+        "depth_snapshot_limit": 1000,
+        "d0_enabled": d0_enabled,
+        "exchange": "binance_usdm",
+        "mark_price_interval_ms": 1000,
+        "open_interest_interval_seconds": open_interest_interval_seconds,
+        "raw_schema": 1,
+        "streams": sorted(streams),
+    }
+    return canonical_json_bytes(payload)
+
+
+def data_contract_hash_v1(
+    *, d0_enabled: bool = False, open_interest_interval_seconds: int = 30
+) -> str:
+    return sha256_bytes(
+        data_contract_v1(
+            d0_enabled=d0_enabled,
+            open_interest_interval_seconds=open_interest_interval_seconds,
+        )
+    )

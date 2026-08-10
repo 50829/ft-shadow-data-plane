@@ -24,22 +24,25 @@ RAW_EVENT_SCHEMA_V1 = pa.schema(
 
 
 def raw_events_to_table(events: list[RawEventV1]) -> pa.Table:
-    rows = [
+    return pa.Table.from_pydict(
         {
-            "schema_version": event.schema_version,
-            "exchange_symbol": event.exchange_symbol,
-            "stream_type": event.stream_type.value,
-            "collector_id": event.collector_id,
-            "boot_id": event.boot_id,
-            "segment_id": event.segment_id,
-            "connection_id": event.connection_id,
-            "receive_seq": event.receive_seq,
-            "app_receive_realtime_ns": event.app_receive_realtime_ns,
-            "app_receive_monotonic_ns": event.app_receive_monotonic_ns,
-            "payload_bytes": event.payload_bytes,
-            "request_id": event.request_id,
-            "request_realtime_ns": event.request_realtime_ns,
-        }
-        for event in events
-    ]
-    return pa.Table.from_pylist(rows, schema=RAW_EVENT_SCHEMA_V1)
+            "schema_version": [event.schema_version for event in events],
+            "exchange_symbol": [event.exchange_symbol for event in events],
+            "stream_type": [event.stream_type.value for event in events],
+            "collector_id": [event.collector_id for event in events],
+            "boot_id": [event.boot_id for event in events],
+            "segment_id": [event.segment_id for event in events],
+            "connection_id": [event.connection_id for event in events],
+            "receive_seq": [event.receive_seq for event in events],
+            "app_receive_realtime_ns": [
+                event.app_receive_realtime_ns for event in events
+            ],
+            "app_receive_monotonic_ns": [
+                event.app_receive_monotonic_ns for event in events
+            ],
+            "payload_bytes": [event.payload_bytes for event in events],
+            "request_id": [event.request_id for event in events],
+            "request_realtime_ns": [event.request_realtime_ns for event in events],
+        },
+        schema=RAW_EVENT_SCHEMA_V1,
+    )

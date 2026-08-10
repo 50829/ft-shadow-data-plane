@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,13 +45,16 @@ class SpoolManager:
         )
 
     def apply_acks(self) -> int:
+        ack_paths = sorted(self.ack_root.glob("*.ack.json"))
+        if not ack_paths:
+            return 0
         manifests = {
             manifest.chunk_id: (path, manifest)
             for path in self.ready_root.rglob("*.manifest.json")
             for manifest in (MANIFEST_ADAPTER.validate_json(path.read_bytes()),)
         }
         removed = 0
-        for ack_path in sorted(self.ack_root.glob("*.ack.json")):
+        for ack_path in ack_paths:
             ack = ACK_ADAPTER.validate_json(ack_path.read_bytes())
             item = manifests.get(ack.chunk_id)
             if item is None:
@@ -93,8 +97,22 @@ class SpoolManager:
 def _tree_size(root: Path) -> int:
     if not root.exists():
         return 0
-    return sum(
-        path.stat().st_size
-        for path in root.rglob("*")
-        if path.is_file() and not path.is_symlink()
-    )
+    total = 0
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except FileNotFoundError:
+                        continue
+        except FileNotFoundError:
+            continue
+    return total

@@ -96,6 +96,16 @@ async def test_queue_hard_limit_rejects_without_silent_eviction() -> None:
     assert queues.used_bytes == 0
 
 
+def test_spool_skips_manifest_scan_when_there_are_no_acks(tmp_path: Path) -> None:
+    spool = SpoolManager(tmp_path, max_bytes=10**9, minimum_free_bytes=0)
+    spool.initialize()
+    malformed = tmp_path / "ready/date=2026-08-10/writer=depth/bad.manifest.json"
+    malformed.parent.mkdir(parents=True)
+    malformed.write_bytes(b"not-json")
+
+    assert spool.apply_acks() == 0
+
+
 @pytest.mark.asyncio
 async def test_open_gap_survives_restart_until_explicit_close(tmp_path: Path) -> None:
     day_index = DayIndex(tmp_path, "tokyo01")
