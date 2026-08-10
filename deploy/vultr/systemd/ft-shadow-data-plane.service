@@ -10,7 +10,7 @@ StartLimitBurst=5
 [Service]
 Type=simple
 EnvironmentFile=/etc/ft-shadow-data-plane/edge.env
-WorkingDirectory=/opt/ft-shadow-data-plane/deploy/edge
+WorkingDirectory=/opt/ft-shadow-data-plane/deploy/vultr
 ExecStart=/usr/bin/docker compose up --no-build --no-deps
 ExecStop=/usr/bin/docker compose stop --timeout 120
 Restart=on-failure

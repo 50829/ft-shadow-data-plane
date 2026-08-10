@@ -1,5 +1,5 @@
 collector_id: tokyo01
-data_root: /var/lib/ft-shadow-data-plane
+data_root: /data
 bootstrap_instruments:
   - BTCUSDT
   - ETHUSDT

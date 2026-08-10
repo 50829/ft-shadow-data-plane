@@ -1,57 +1,30 @@
 # 部署
 
-## Edge
-
-目标是 Ubuntu 24.04、Docker、1C1G、25GB SSD。先创建与容器 UID 一致的受限 SFTP 用户
-和目录；以下命令需要 root，正式执行前核对 UID 未被占用：
-
-```bash
-useradd --uid 10001 --home-dir / --no-create-home --shell /usr/sbin/nologin data-puller
-install -d -o root -g root -m 755 /srv/ft-data-sftp
-install -d -o 10001 -g 10001 -m 750 \
-  /srv/ft-data-sftp/ready \
-  /srv/ft-data-sftp/writing \
-  /srv/ft-data-sftp/control \
-  /srv/ft-data-sftp/control/acks \
-  /srv/ft-data-sftp/control/universe/inbox
-```
-
-`sshd_config` 为该账户追加：
+生产系统分为两个明确的部署目标：
 
 ```text
-Match User data-puller
-    ChrootDirectory /srv/ft-data-sftp
-    ForceCommand internal-sftp
-    PasswordAuthentication no
-    DisableForwarding yes
-    PermitTunnel no
+Vultr edge
+  Binance -> collector -> Parquet/Zstd raw -> restricted SFTP
+
+Campus 107
+  minute cron pull -> persistent raw -> Slurm normalize/L2/finalize -> derived
 ```
 
-仅安装校园 puller 的 SSH public key，并在防火墙允许校园出口 IP 访问 SSH。采集器不发布
-任何 TCP 端口。将 `edge.yaml` 的 `data_root` 设置为 `/data`，再安装 compose、systemd unit
-和固定 digest 的 `edge.env`。镜像升级只修改 digest 后重启 unit，接受短暂 planned gap。
+每台机器都有独立且自包含的部署入口：
 
-`alert.env` 只包含 `ALERT_EMAIL=...`；主机必须已经配置可用的 `mail`/MTA。
+- Vultr 安装、SFTP 限制、启动、检查和升级：
+  [`deploy/vultr/README.md`](../deploy/vultr/README.md)
+- 校园 107 的 SIF、拉取 cron、Slurm 处理、检查和升级：
+  [`deploy/campus-107/README.md`](../deploy/campus-107/README.md)
 
-## Campus Pull
+发布 tag 会生成 Vultr 使用的不可变 OCI image digest，以及校园使用的 SIF 和 SHA-256。
+不要从 `main` 临时构建生产版本，也不要在两台机器之间手工复制未校验的 Python 源码。
 
-生产前必须获得管理员对以下行为的书面许可：login node 每分钟运行一次轻量 SFTP pull，
-只做下载、hash、fsync、rename 和 ACK；解析与 Parquet 处理全部进入 Slurm。
+生产前必须获得管理员对 login node 每分钟执行轻量 SFTP pull 的书面许可。pull 只执行
+下载、hash、fsync、rename 和 ACK；解析与 Parquet 处理全部进入 Slurm。
 
-把 release SIF、`central.yaml` 和 `crontab.example` 放到 persistent user directory。首次连接
-需人工核对并固定 edge SSH host key，禁止使用 `AutoAddPolicy` 或关闭 host-key 检查。
-
-## Slurm
-
-先提交 normalize，成功后提交最多 16 并发的 symbol array，最后以依赖关系提交 finalize：
-
-```bash
-normalize_job=$(sbatch --parsable deploy/slurm/normalize.sbatch)
-l2_job=$(sbatch --parsable --dependency=afterok:$normalize_job --array=0-59%16 deploy/slurm/l2-array.sbatch)
-sbatch --dependency=afterok:$l2_job deploy/slurm/finalize.sbatch
-```
-
-数组上限必须等于 `symbols` 文件行数减一，不能机械使用示例中的 `59`。
+Slurm 的 normalize、L2 array 和 finalize 依赖关系由校园部署目录中的 `submit-day.sh`
+统一生成。脚本根据 symbol 文件计算 array 上限，避免手工填写 `0-59` 一类容易出错的值。
 
 ## Canary
 

@@ -6,6 +6,15 @@ L2 重建和质量账本。任何无法证明连续的数据都表示为 gap，�
 实施合同见 [docs/implementation-plan.md](docs/implementation-plan.md)，部署前置与 canary 标准见
 [docs/deployment.md](docs/deployment.md)。旧 `ft-shadow` 仓库不是运行依赖。
 
+## 部署入口
+
+部署文件按目标机器组织，不需要在多个目录之间拼装：
+
+| 目标机器 | 职责 | 部署入口 |
+| --- | --- | --- |
+| Vultr 边缘机 | 采集 Binance 行情、保存并发布 raw chunk | [`deploy/vultr/README.md`](deploy/vultr/README.md) |
+| 校园 107 | 定时拉取 raw，并向 Slurm 提交规范化和 L2 任务 | [`deploy/campus-107/README.md`](deploy/campus-107/README.md) |
+
 ## 数据范围
 
 正式采集 `depth@100ms`、`bookTicker`、`aggTrade`、`markPrice@1s`、`forceOrder`、
@@ -28,12 +37,13 @@ uv run mypy src
 ## 运行边缘采集器
 
 ```bash
-cp config/edge.example.yaml config/edge.yaml
-uv run ft-data-edge --config config/edge.yaml
+cp deploy/vultr/edge.yaml.example /tmp/edge.yaml
+# 本地运行时把 /tmp/edge.yaml 的 data_root 改为本地可写目录
+uv run ft-data-edge --config /tmp/edge.yaml
 ```
 
-生产使用 `deploy/edge/compose.yaml` 和 systemd unit；容器内 `data_root` 必须为 `/data`。
-初始 1C1G、25GB SSD 只是 canary 候选，不是容量结论。
+生产部署从 [`deploy/vultr/README.md`](deploy/vultr/README.md) 开始；容器内 `data_root`
+必须为 `/data`。初始 1C1G、25GB SSD 只是 canary 候选，不是容量结论。
 
 ## 更新 universe
 
@@ -55,11 +65,13 @@ DAILY 更新最多增删各 5 个成员，已有成员至少停留 48 小时。`
 ## 中心单次拉取
 
 ```bash
-cp config/central.example.yaml config/central.yaml
-uv run ft-data-pull --config config/central.yaml
+cp deploy/campus-107/central.yaml.example /tmp/central.yaml
+uv run ft-data-pull --config /tmp/central.yaml
 ```
 
 该命令设计为由校园 login node 的 cron 每分钟调用一次。正式部署前必须获得管理员许可。
+校园端完整安装、验证和 Slurm 提交流程见
+[`deploy/campus-107/README.md`](deploy/campus-107/README.md)。
 
 ## 中心处理
 

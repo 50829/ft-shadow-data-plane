@@ -10,5 +10,8 @@ dist/
 .coverage
 htmlcov/
 data/
-config/*.yaml
-!config/*.example.yaml
+deploy/vultr/edge.yaml
+deploy/vultr/edge.env
+deploy/vultr/alert.env
+deploy/campus-107/central.yaml
+deploy/campus-107/processing.env
