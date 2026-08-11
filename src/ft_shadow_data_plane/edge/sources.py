@@ -52,6 +52,9 @@ class RouteRunner:
         rest: BinanceRestClient,
         rotation_seconds: int,
         overlap_seconds: int,
+        receive_timeout_seconds: float,
+        ping_interval_seconds: float,
+        ping_timeout_seconds: float,
         service_stop: asyncio.Event,
         rotation_offset_seconds: float = 0,
         d0_enabled: bool = False,
@@ -71,6 +74,9 @@ class RouteRunner:
         self._rotation_seconds = rotation_seconds
         self._next_rotation_seconds = rotation_seconds + rotation_offset_seconds
         self._overlap_seconds = overlap_seconds
+        self._receive_timeout_seconds = receive_timeout_seconds
+        self._ping_interval_seconds = ping_interval_seconds
+        self._ping_timeout_seconds = ping_timeout_seconds
         self._service_stop = service_stop
         self._d0_enabled = d0_enabled
         self._on_ready = on_ready or (lambda _: None)
@@ -92,6 +98,12 @@ class RouteRunner:
                             exchange_symbols=self._instruments,
                             stream_types=self._stream_types,
                             detail=f"{self._name} recovered",
+                        )
+                        logger.info(
+                            "connection recovered route=%s connection_id=%s gap_id=%s",
+                            self._name,
+                            current.identity.connection_id,
+                            gap_id,
                         )
                         gap_id = None
                 except QueueOverloaded as exc:
@@ -123,6 +135,13 @@ class RouteRunner:
                     gap_reason,
                     str(error or "connection closed"),
                     connection_id=current.identity.connection_id,
+                )
+                logger.warning(
+                    "connection failed route=%s connection_id=%s gap_id=%s error=%s",
+                    self._name,
+                    current.identity.connection_id,
+                    gap_id,
+                    error or "connection closed",
                 )
                 current = None
                 if gap_reason is GapReason.INGEST_OVERLOAD:
@@ -173,6 +192,9 @@ class RouteRunner:
             rest=self._rest,
             ready=ready,
             stop=stop,
+            receive_timeout_seconds=self._receive_timeout_seconds,
+            ping_interval_seconds=self._ping_interval_seconds,
+            ping_timeout_seconds=self._ping_timeout_seconds,
             on_depth_gap=self._open_depth_gap,
             on_depth_reanchored=self._close_depth_gap,
         )
@@ -603,6 +625,9 @@ class SourceManager:
                         rotation_seconds=self._config.connection_rotation_seconds,
                         rotation_offset_seconds=rotation_offset,
                         overlap_seconds=self._config.connection_overlap_seconds,
+                        receive_timeout_seconds=self._config.websocket_receive_timeout_seconds,
+                        ping_interval_seconds=self._config.websocket_ping_interval_seconds,
+                        ping_timeout_seconds=self._config.websocket_ping_timeout_seconds,
                         service_stop=stop,
                         d0_enabled=self._config.d0_enabled,
                         on_ready=mark_ready,
@@ -628,6 +653,9 @@ class SourceManager:
                     rest=rest,
                     rotation_seconds=self._config.connection_rotation_seconds,
                     overlap_seconds=self._config.connection_overlap_seconds,
+                    receive_timeout_seconds=self._config.websocket_receive_timeout_seconds,
+                    ping_interval_seconds=self._config.websocket_ping_interval_seconds,
+                    ping_timeout_seconds=self._config.websocket_ping_timeout_seconds,
                     service_stop=stop,
                     on_ready=mark_ready,
                 ).run()

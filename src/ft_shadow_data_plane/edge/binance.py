@@ -151,6 +151,9 @@ class BinanceWebSocketConnection:
         rest: BinanceRestClient,
         ready: asyncio.Event,
         stop: asyncio.Event,
+        receive_timeout_seconds: float,
+        ping_interval_seconds: float,
+        ping_timeout_seconds: float,
         on_depth_gap: Callable[[str, str, StreamType, int, int], Awaitable[str]],
         on_depth_reanchored: Callable[[str, str, StreamType], Awaitable[None]],
     ) -> None:
@@ -162,6 +165,9 @@ class BinanceWebSocketConnection:
         self._rest = rest
         self._ready = ready
         self._stop = stop
+        self._receive_timeout_seconds = receive_timeout_seconds
+        self._ping_interval_seconds = ping_interval_seconds
+        self._ping_timeout_seconds = ping_timeout_seconds
         self._on_depth_gap = on_depth_gap
         self._on_depth_reanchored = on_depth_reanchored
         self._previous_u: dict[tuple[StreamType, str], int] = {}
@@ -173,7 +179,8 @@ class BinanceWebSocketConnection:
         try:
             async with connect(
                 self._url,
-                ping_interval=None,
+                ping_interval=self._ping_interval_seconds,
+                ping_timeout=self._ping_timeout_seconds,
                 max_queue=16,
                 max_size=16 * 1024 * 1024,
                 close_timeout=10,
@@ -188,7 +195,15 @@ class BinanceWebSocketConnection:
                     ).decode()
                 )
                 while not self._stop.is_set():
-                    raw = await websocket.recv(decode=False)
+                    try:
+                        async with asyncio.timeout(self._receive_timeout_seconds):
+                            raw = await websocket.recv(decode=False)
+                    except TimeoutError as exc:
+                        raise TimeoutError(
+                            "no websocket message for "
+                            f"{self._receive_timeout_seconds:g}s "
+                            f"connection_id={self._identity.connection_id}"
+                        ) from exc
                     realtime_ns = time.time_ns()
                     monotonic_ns = time.monotonic_ns()
                     if not isinstance(raw, bytes):

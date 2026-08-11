@@ -1,11 +1,52 @@
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
+
 import orjson
 import pytest
 
 from ft_shadow_data_plane.central.binance import parse_typed_row
-from ft_shadow_data_plane.contracts.models import StreamType
-from ft_shadow_data_plane.edge.binance import SourceIdentity, decode_websocket
+from ft_shadow_data_plane.contracts.models import RawEventV1, StreamType
+from ft_shadow_data_plane.edge.binance import (
+    BinanceWebSocketConnection,
+    SourceIdentity,
+    decode_websocket,
+)
+
+
+class StalledWebSocket:
+    def __init__(self) -> None:
+        self.subscription_id: int | None = None
+        self.receive_calls = 0
+        self.stalled = asyncio.Event()
+
+    async def __aenter__(self) -> StalledWebSocket:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+    async def send(self, value: str) -> None:
+        message = orjson.loads(value)
+        self.subscription_id = int(message["id"])
+
+    async def recv(self, *, decode: bool) -> bytes:
+        assert decode is False
+        self.receive_calls += 1
+        if self.receive_calls == 1:
+            return orjson.dumps({"result": None, "id": self.subscription_id})
+        self.stalled.set()
+        await asyncio.Future()
+        raise AssertionError("unreachable")
+
+
+class RecordingIngest:
+    def __init__(self) -> None:
+        self.events: list[RawEventV1] = []
+
+    async def put(self, event: RawEventV1) -> None:
+        self.events.append(event)
 
 
 @pytest.mark.parametrize(
@@ -162,3 +203,47 @@ def test_source_identity_assigns_sequence_without_async_scheduling() -> None:
     )
 
     assert (first.receive_seq, second.receive_seq) == (1, 2)
+
+
+@pytest.mark.asyncio
+async def test_websocket_silence_fails_the_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+    websocket = StalledWebSocket()
+    ingest = RecordingIngest()
+
+    monkeypatch.setattr(
+        "ft_shadow_data_plane.edge.binance.connect",
+        lambda *args, **kwargs: websocket,
+    )
+
+    async def open_depth_gap(*args: object) -> str:
+        return "gap-depth"
+
+    async def close_depth_gap(*args: object) -> None:
+        return None
+
+    connection = BinanceWebSocketConnection(
+        url="wss://example.invalid/stream",
+        subscriptions=("btcusdt@aggTrade",),
+        identity=SourceIdentity("tokyo01", "boot", "segment", "connection"),
+        ingest=ingest,  # type: ignore[arg-type]
+        snapshot_requests=(),
+        rest=SimpleNamespace(),  # type: ignore[arg-type]
+        ready=asyncio.Event(),
+        stop=asyncio.Event(),
+        receive_timeout_seconds=0.01,
+        ping_interval_seconds=20,
+        ping_timeout_seconds=20,
+        on_depth_gap=open_depth_gap,
+        on_depth_reanchored=close_depth_gap,
+    )
+
+    task = asyncio.create_task(connection.run())
+    try:
+        await asyncio.wait_for(websocket.stalled.wait(), timeout=0.5)
+        await asyncio.sleep(0.05)
+        assert task.done(), "a silent websocket remained stuck in recv()"
+        with pytest.raises(TimeoutError, match="no websocket message"):
+            await task
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

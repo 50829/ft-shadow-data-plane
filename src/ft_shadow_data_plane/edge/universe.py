@@ -66,19 +66,7 @@ class UniverseStore:
         reasons: frozenset[ControlReason] | None = None,
     ) -> UniverseControlV1 | None:
         now = now or datetime.now(UTC)
-        candidates: list[tuple[Path, UniverseControlV1]] = []
-        for path in sorted(self._inbox.glob("*.control.json")):
-            try:
-                control = UniverseControlV1.model_validate_json(path.read_bytes())
-            except ValueError:
-                logger.exception("ignoring invalid universe control path=%s", path)
-                continue
-            if (
-                control.generation > self.active.generation
-                and control.effective_at <= now
-                and (reasons is None or control.reason in reasons)
-            ):
-                candidates.append((path, control))
+        candidates = self._due_candidates(now, reasons)
         if not candidates:
             return None
         selected_path, selected = max(candidates, key=lambda item: item[1].generation)
@@ -103,6 +91,34 @@ class UniverseStore:
             if control.generation <= selected.generation:
                 path.unlink(missing_ok=True)
         return selected
+
+    def has_due(
+        self,
+        now: datetime,
+        *,
+        reasons: frozenset[ControlReason] | None = None,
+    ) -> bool:
+        return bool(self._due_candidates(now, reasons))
+
+    def _due_candidates(
+        self,
+        now: datetime,
+        reasons: frozenset[ControlReason] | None,
+    ) -> list[tuple[Path, UniverseControlV1]]:
+        candidates: list[tuple[Path, UniverseControlV1]] = []
+        for path in sorted(self._inbox.glob("*.control.json")):
+            try:
+                control = UniverseControlV1.model_validate_json(path.read_bytes())
+            except ValueError:
+                logger.exception("ignoring invalid universe control path=%s", path)
+                continue
+            if (
+                control.generation > self.active.generation
+                and control.effective_at <= now
+                and (reasons is None or control.reason in reasons)
+            ):
+                candidates.append((path, control))
+        return candidates
 
     def _validate_transition(self, selected: UniverseControlV1) -> None:
         current = set(self.active.members)

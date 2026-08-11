@@ -8,7 +8,13 @@ import aiohttp
 import pytest
 
 from ft_shadow_data_plane.contracts.models import GapReason, RawEventV1, StreamType
-from ft_shadow_data_plane.edge.sources import RestPollers, _advance_deadline
+from ft_shadow_data_plane.edge.binance import SourceIdentity
+from ft_shadow_data_plane.edge.sources import (
+    ConnectionHandle,
+    RestPollers,
+    RouteRunner,
+    _advance_deadline,
+)
 
 
 class FakeRest:
@@ -71,6 +77,36 @@ class FakeGaps:
         self.closed.append((gap_id, reason, exchange_symbols, stream_types))
 
 
+class RouteGaps:
+    def __init__(self) -> None:
+        self.opened: list[tuple[GapReason, str | None]] = []
+        self.closed: list[tuple[str, GapReason, str | None]] = []
+
+    async def open(
+        self,
+        reason: GapReason,
+        *,
+        connection_id: str | None = None,
+        exchange_symbols: tuple[str, ...],
+        stream_types: tuple[StreamType, ...],
+        detail: str,
+    ) -> str:
+        self.opened.append((reason, connection_id))
+        return "gap-connection"
+
+    async def close(
+        self,
+        gap_id: str,
+        reason: GapReason,
+        *,
+        connection_id: str | None = None,
+        exchange_symbols: tuple[str, ...],
+        stream_types: tuple[StreamType, ...],
+        detail: str,
+    ) -> None:
+        self.closed.append((gap_id, reason, connection_id))
+
+
 @pytest.mark.asyncio
 async def test_open_interest_failure_is_tracked_per_symbol() -> None:
     stop = asyncio.Event()
@@ -109,3 +145,61 @@ async def test_open_interest_failure_is_tracked_per_symbol() -> None:
 def test_fixed_rate_deadline_skips_missed_slots_without_drifting() -> None:
     assert _advance_deadline(100.0, 30.0, 101.0) == 130.0
     assert _advance_deadline(100.0, 30.0, 170.0) == 190.0
+
+
+@pytest.mark.asyncio
+async def test_route_timeout_opens_gap_and_recovery_closes_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop = asyncio.Event()
+    gaps = RouteGaps()
+    runner = RouteRunner(
+        name="market-0",
+        url="wss://example.invalid/stream",
+        subscriptions=("btcusdt@aggTrade",),
+        instruments=("BTCUSDT",),
+        stream_types=(StreamType.AGG_TRADE,),
+        collector_id="tokyo01",
+        boot_id="boot",
+        ingest=SimpleNamespace(),  # type: ignore[arg-type]
+        queues=FakeQueues(),  # type: ignore[arg-type]
+        gaps=gaps,  # type: ignore[arg-type]
+        rest=SimpleNamespace(),  # type: ignore[arg-type]
+        rotation_seconds=82_800,
+        overlap_seconds=15,
+        receive_timeout_seconds=30,
+        ping_interval_seconds=20,
+        ping_timeout_seconds=20,
+        service_stop=stop,
+    )
+    starts = 0
+
+    async def fail_silently() -> None:
+        raise TimeoutError("no websocket message for 30s")
+
+    async def wait_until_cancelled() -> None:
+        await asyncio.Event().wait()
+
+    async def start_connection() -> ConnectionHandle:
+        nonlocal starts
+        starts += 1
+        identity = SourceIdentity("tokyo01", "boot", f"segment-{starts}", f"connection-{starts}")
+        if starts == 1:
+            task = asyncio.create_task(fail_silently())
+        else:
+            task = asyncio.create_task(wait_until_cancelled())
+            asyncio.get_running_loop().call_soon(stop.set)
+        return ConnectionHandle(identity, asyncio.Event(), asyncio.Event(), task)
+
+    async def skip_retry_delay(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(runner, "_start_ready_connection", start_connection)
+    monkeypatch.setattr(runner, "_wait_or_stop", skip_retry_delay)
+
+    await asyncio.wait_for(runner.run(), timeout=0.5)
+
+    assert gaps.opened == [(GapReason.CONNECTION_LOST, "connection-1")]
+    assert gaps.closed == [
+        ("gap-connection", GapReason.CONNECTION_LOST, "connection-2")
+    ]

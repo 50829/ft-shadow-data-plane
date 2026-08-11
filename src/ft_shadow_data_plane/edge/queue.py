@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 
 from ft_shadow_data_plane.contracts.models import RawEventV1, WriterGroup
@@ -38,7 +39,6 @@ class ByteBoundedQueues:
         self.warn_bytes = int(max_bytes * warn_ratio)
         self.resume_bytes = int(max_bytes * resume_ratio)
         self._used_bytes = 0
-        self._condition = asyncio.Condition()
         self._queues = {
             group: asyncio.Queue[WriterItem]()
             for group in (
@@ -47,6 +47,10 @@ class ByteBoundedQueues:
                 WriterGroup.METADATA,
             )
         }
+        self._last_event_monotonic: dict[WriterGroup, float | None] = {
+            group: None for group in self._queues
+        }
+        self._condition = asyncio.Condition()
 
     @property
     def used_bytes(self) -> int:
@@ -55,6 +59,12 @@ class ByteBoundedQueues:
     @property
     def utilization(self) -> float:
         return self._used_bytes / self.max_bytes
+
+    def idle_seconds(self, group: WriterGroup, *, now: float | None = None) -> float | None:
+        last_event = self._last_event_monotonic[group]
+        if last_event is None:
+            return None
+        return max(0.0, (time.monotonic() if now is None else now) - last_event)
 
     async def put(self, event: RawEventV1) -> None:
         reserved = event.approximate_size_bytes
@@ -65,6 +75,7 @@ class ByteBoundedQueues:
                     f"max={self.max_bytes}"
                 )
             self._used_bytes += reserved
+            self._last_event_monotonic[event.writer_group] = time.monotonic()
         self._queues[event.writer_group].put_nowait(QueuedEvent(event, reserved))
 
     async def get(self, group: WriterGroup) -> WriterItem:

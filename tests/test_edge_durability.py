@@ -13,6 +13,7 @@ from ft_shadow_data_plane.contracts.models import (
     GapState,
     RawEventV1,
     StreamType,
+    WriterGroup,
 )
 from ft_shadow_data_plane.contracts.serde import atomic_write_bytes, canonical_json_bytes
 from ft_shadow_data_plane.edge.day_index import DayIndex
@@ -94,6 +95,17 @@ async def test_queue_hard_limit_rejects_without_silent_eviction() -> None:
     with pytest.raises(QueueOverloaded):
         await queues.put(_event(1, b"x" * 100))
     assert queues.used_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_queue_tracks_activity_per_writer_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    queues = ByteBoundedQueues(2_000, warn_ratio=0.7, resume_ratio=0.5)
+    monkeypatch.setattr("ft_shadow_data_plane.edge.queue.time.monotonic", lambda: 100.0)
+
+    await queues.put(_event(1, b'{"depth":1}'))
+
+    assert queues.idle_seconds(WriterGroup.TRADES_MARKET, now=103.5) == 3.5
+    assert queues.idle_seconds(WriterGroup.DEPTH, now=103.5) is None
 
 
 def test_spool_skips_manifest_scan_when_there_are_no_acks(tmp_path: Path) -> None:

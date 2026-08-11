@@ -83,6 +83,25 @@ def test_canary_control_cannot_remove_members(tmp_path: Path) -> None:
     assert store.active.members == initial
 
 
+def test_has_due_does_not_apply_or_remove_control(tmp_path: Path) -> None:
+    effective = datetime(2026, 8, 11, tzinfo=UTC)
+    store = UniverseStore(tmp_path, _members(20))
+    initial = store.initialize()
+    control = _control(
+        2,
+        effective,
+        _members(40),
+        created=effective - timedelta(hours=12),
+    )
+    _write_control(tmp_path, control)
+
+    assert store.has_due(
+        effective, reasons=frozenset({ControlReason.CANARY_SCALE})
+    )
+    assert store.active == initial
+    assert (tmp_path / "control/universe/inbox/2.control.json").exists()
+
+
 def test_final_canary_enters_steady_state_before_accepting_probes(tmp_path: Path) -> None:
     store = UniverseStore(tmp_path, _members(20))
     store.initialize()

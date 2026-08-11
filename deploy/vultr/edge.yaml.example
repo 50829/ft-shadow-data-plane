@@ -28,6 +28,9 @@ rest_url: https://fapi.binance.com
 public_connection_shards: 4
 connection_rotation_seconds: 82800
 connection_overlap_seconds: 15
+websocket_receive_timeout_seconds: 30
+websocket_ping_interval_seconds: 20
+websocket_ping_timeout_seconds: 20
 open_interest_interval_seconds: 30
 exchange_info_interval_seconds: 86400
 clock_sample_interval_seconds: 60

@@ -12,7 +12,12 @@ from uuid import uuid4
 import pyarrow as pa
 
 from ft_shadow_data_plane.contracts.data_contract import data_contract_hash_v1
-from ft_shadow_data_plane.contracts.models import ControlReason, GapEventV1, GapReason
+from ft_shadow_data_plane.contracts.models import (
+    ControlReason,
+    GapEventV1,
+    GapReason,
+    WriterGroup,
+)
 from ft_shadow_data_plane.edge.config import EdgeConfig
 from ft_shadow_data_plane.edge.day_index import DayIndex
 from ft_shadow_data_plane.edge.gaps import GapJournal
@@ -188,35 +193,67 @@ class EdgeService:
             await _wait_event(self._stop, pre_boundary)
             if self._stop.is_set():
                 return
+            reasons = frozenset({ControlReason.DAILY, ControlReason.CANARY_SCALE})
+            planned_transition = self._universe_store.has_due(midnight, reasons=reasons)
+            if not planned_transition:
+                # Keep ingest online and let pre-midnight callbacks drain before sealing.
+                await _sleep_until(midnight + timedelta(seconds=2))
+                if self._stop.is_set():
+                    return
             async with self._operation_lock:
-                was_running = self._sources.running
-                boundary_gap = await self._gaps.open(
-                    GapReason.PLANNED_BOUNDARY,
-                    exchange_symbols=self._universe_store.active.members,
-                    detail="UTC midnight writer and universe boundary",
-                )
-                await self._sources.stop()
-                await _sleep_until(midnight)
-                previous_date = midnight.date() - timedelta(days=1)
-                await self._gaps.rollover(midnight)
-                control = self._universe_store.apply_due(
+                await self._apply_midnight_boundary(
                     midnight,
-                    reasons=frozenset({ControlReason.DAILY, ControlReason.CANARY_SCALE}),
+                    reasons=reasons,
+                    planned_transition=planned_transition,
                 )
-                active = control or self._universe_store.active
-                await self._ingest.rotate(universe_hash=active.universe_hash)
-                self._gaps.set_universe_hash(active.universe_hash)
-                await self._day_index.seal(previous_date, sealed_at=midnight)
-                status = await asyncio.to_thread(self._spool.status)
-                if was_running and not status.hard_limited:
-                    await self._sources.start(active.members)
-                    await self._sources.wait_ready()
-                await self._gaps.close(
-                    boundary_gap,
-                    GapReason.PLANNED_BOUNDARY,
-                    exchange_symbols=active.members,
-                    detail="all sources ready after UTC boundary",
-                )
+
+    async def _apply_midnight_boundary(
+        self,
+        midnight: datetime,
+        *,
+        reasons: frozenset[ControlReason],
+        planned_transition: bool,
+    ) -> None:
+        was_running = self._sources.running
+        boundary_gap: str | None = None
+        stopped_for_transition = False
+        if planned_transition and was_running:
+            boundary_gap = await self._gaps.open(
+                GapReason.PLANNED_BOUNDARY,
+                exchange_symbols=self._universe_store.active.members,
+                detail="UTC midnight universe transition",
+            )
+            await self._sources.stop()
+            stopped_for_transition = True
+        await _sleep_until(midnight)
+        previous_date = midnight.date() - timedelta(days=1)
+        await self._gaps.rollover(midnight)
+        control = self._universe_store.apply_due(midnight, reasons=reasons)
+        active = control or self._universe_store.active
+        if control is not None and was_running and not stopped_for_transition:
+            boundary_gap = await self._gaps.open(
+                GapReason.PLANNED_BOUNDARY,
+                exchange_symbols=self._universe_store.active.members,
+                detail="late UTC midnight universe transition",
+            )
+            await self._sources.stop()
+            stopped_for_transition = True
+        await self._ingest.rotate(universe_hash=active.universe_hash)
+        self._gaps.set_universe_hash(active.universe_hash)
+        await self._day_index.seal(previous_date, sealed_at=midnight)
+        if not stopped_for_transition or boundary_gap is None:
+            logger.info("sealed UTC day online date=%s", previous_date)
+            return
+        status = await asyncio.to_thread(self._spool.status)
+        if was_running and not status.hard_limited:
+            await self._sources.start(active.members)
+            await self._sources.wait_ready()
+        await self._gaps.close(
+            boundary_gap,
+            GapReason.PLANNED_BOUNDARY,
+            exchange_symbols=active.members,
+            detail="all sources ready after UTC universe transition",
+        )
 
     async def _control_loop(self) -> None:
         while not self._stop.is_set():
@@ -261,6 +298,14 @@ class EdgeService:
             write_bytes_per_second = (
                 writer.compressed_bytes - self._previous_written_bytes
             ) / elapsed
+            writer_idle = {
+                group: self._queues.idle_seconds(group, now=now)
+                for group in (
+                    WriterGroup.DEPTH,
+                    WriterGroup.TRADES_MARKET,
+                    WriterGroup.METADATA,
+                )
+            }
             event_loop_lag = max(0.0, elapsed - 60.0) if previous_tick else 0.0
             self._previous_written_bytes = writer.compressed_bytes
             previous_tick = now
@@ -268,7 +313,8 @@ class EdgeService:
                 "collector status queue_bytes=%d queue_ratio=%.3f spool_bytes=%d "
                 "free_bytes=%d rss_bytes=%d arrow_bytes=%d cpu_user_s=%.3f cpu_system_s=%.3f "
                 "cpu_steal_ratio=%.4f event_loop_lag_s=%.6f chunks=%d events=%d "
-                "compressed_bytes=%d write_bytes_s=%.1f max_finalize_s=%.6f",
+                "compressed_bytes=%d write_bytes_s=%.1f max_finalize_s=%.6f "
+                "depth_idle_s=%.3f trades_market_idle_s=%.3f metadata_idle_s=%.3f",
                 self._queues.used_bytes,
                 self._queues.utilization,
                 status.used_bytes,
@@ -284,6 +330,9 @@ class EdgeService:
                 writer.compressed_bytes,
                 write_bytes_per_second,
                 writer.max_finalize_seconds,
+                _idle_metric(writer_idle[WriterGroup.DEPTH]),
+                _idle_metric(writer_idle[WriterGroup.TRADES_MARKET]),
+                _idle_metric(writer_idle[WriterGroup.METADATA]),
             )
             await _wait_event(self._stop, 60)
 
@@ -338,6 +387,10 @@ def _current_rss_bytes() -> int:
         return int(fields[1]) * os.sysconf("SC_PAGE_SIZE")
     except (FileNotFoundError, IndexError, ValueError):
         return 0
+
+
+def _idle_metric(value: float | None) -> float:
+    return -1.0 if value is None else value
 
 
 def _host_cpu_sample() -> tuple[int, int]:
