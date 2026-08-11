@@ -53,10 +53,10 @@ case "$FT_L2_CONCURRENCY" in
         ;;
 esac
 
-if ! awk 'NF != 1 || $1 !~ /^[A-Z0-9]{1,30}$/ || seen[$1]++ { exit 1 } END { if (NR == 0) exit 1 }' \
+if ! awk 'NF != 1 || $1 !~ /^[A-Z0-9]{1,30}$/ || seen[$1]++ { exit 1 } END { if (NR != 60) exit 1 }' \
     "$symbols_file"
 then
-    echo "symbols must be unique uppercase Binance symbols, one per line, with no blanks" >&2
+    echo "symbols must contain exactly 60 unique uppercase Binance symbols, one per line" >&2
     exit 1
 fi
 

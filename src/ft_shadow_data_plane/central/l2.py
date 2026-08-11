@@ -7,6 +7,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
 
+import orjson
 import pyarrow.parquet as pq
 from pydantic import BaseModel, ConfigDict, model_validator
 
@@ -140,9 +141,7 @@ class ConnectionBook:
         )
 
     @classmethod
-    def from_anchor_checkpoint(
-        cls, checkpoint: AnchoredBookCheckpointV1
-    ) -> ConnectionBook:
+    def from_anchor_checkpoint(cls, checkpoint: AnchoredBookCheckpointV1) -> ConnectionBook:
         return cls(
             connection_id=checkpoint.connection_id,
             state=checkpoint.state,
@@ -208,9 +207,7 @@ class ConnectionBook:
             (
                 index
                 for index, diff in enumerate(candidates)
-                if diff.first_update_id
-                <= self.anchor_last_update_id
-                <= diff.final_update_id
+                if diff.first_update_id <= self.anchor_last_update_id <= diff.final_update_id
             ),
             None,
         )
@@ -261,10 +258,7 @@ class L2DayReconstructor:
         exchange_symbol: str,
     ) -> None:
         self._typed_root = (
-            derived_root
-            / "typed"
-            / f"collector={collector_id}"
-            / f"date={utc_date.isoformat()}"
+            derived_root / "typed" / f"collector={collector_id}" / f"date={utc_date.isoformat()}"
         )
         self._quality_root = (
             derived_root
@@ -284,13 +278,10 @@ class L2DayReconstructor:
         self._symbol = exchange_symbol
         self._collector_id = collector_id
         self._day_start_ns = int(
-            datetime.combine(utc_date, datetime.min.time(), UTC).timestamp()
-            * 1_000_000_000
+            datetime.combine(utc_date, datetime.min.time(), UTC).timestamp() * 1_000_000_000
         )
         self._day_end_ns = int(
-            datetime.combine(
-                utc_date + timedelta(days=1), datetime.min.time(), UTC
-            ).timestamp()
+            datetime.combine(utc_date + timedelta(days=1), datetime.min.time(), UTC).timestamp()
             * 1_000_000_000
         )
 
@@ -303,7 +294,12 @@ class L2DayReconstructor:
         last_valid_connection: str | None = None
         active_gaps: set[str] = set()
 
+        can_start_without_checkpoint = self._can_start_without_previous_checkpoint()
         checkpoint = self._load_previous_checkpoint()
+        if checkpoint is None and not can_start_without_checkpoint:
+            raise FileNotFoundError(
+                f"previous L2 checkpoint is required for {self._date}: {self._symbol}"
+            )
         if checkpoint is not None:
             if checkpoint.state is L2State.VALID:
                 if checkpoint.connection_id is None:
@@ -323,12 +319,13 @@ class L2DayReconstructor:
 
         def handle_gap(event: GapEventV1) -> None:
             nonlocal authority, valid_from, last_valid_connection
+            effective_ns = _gap_effective_ns(event)
             if event.state is GapState.OPEN:
                 if authority is not None and valid_from is not None:
                     intervals.append(
                         _interval(
                             valid_from,
-                            event.observed_at_realtime_ns,
+                            effective_ns,
                             authority,
                             "transport_gap",
                         )
@@ -342,7 +339,7 @@ class L2DayReconstructor:
                         changes.append(
                             StateChange(
                                 book.connection_id,
-                                event.observed_at_realtime_ns,
+                                effective_ns,
                                 L2State.GAPPED,
                                 book.previous_update_id,
                                 event.reason.value,
@@ -362,7 +359,7 @@ class L2DayReconstructor:
 
         for row in self._depth_rows():
             received_ns = int(row["app_receive_realtime_ns"])
-            while next_gap is not None and next_gap.observed_at_realtime_ns <= received_ns:
+            while next_gap is not None and _gap_effective_ns(next_gap) <= received_ns:
                 handle_gap(next_gap)
                 next_gap = next(gap_events, None)
             connection_id = str(row["connection_id"])
@@ -396,9 +393,7 @@ class L2DayReconstructor:
             handle_gap(next_gap)
             next_gap = next(gap_events, None)
         if authority is not None and valid_from is not None:
-            intervals.append(
-                _interval(valid_from, self._day_end_ns, authority, "utc_day_end")
-            )
+            intervals.append(_interval(valid_from, self._day_end_ns, authority, "utc_day_end"))
         intervals = [
             interval
             for interval in intervals
@@ -408,6 +403,33 @@ class L2DayReconstructor:
         output_checkpoint = self._build_checkpoint(final_book, books)
         self._write(changes, intervals, output_checkpoint)
         return len(changes), len(intervals)
+
+    def _can_start_without_previous_checkpoint(self) -> bool:
+        path = self._typed_root / "_NORMALIZED.json"
+        if not path.exists():
+            raise FileNotFoundError(f"normalized day marker does not exist: {path}")
+        marker = orjson.loads(path.read_bytes())
+        formal_start_ns = marker.get("formal_start_realtime_ns")
+        if formal_start_ns is not None:
+            if not isinstance(formal_start_ns, int) or not (
+                self._day_start_ns <= formal_start_ns < self._day_end_ns
+            ):
+                raise ValueError(f"normalized formal start is invalid: {path}")
+            return True
+
+        previous_date = self._date - timedelta(days=1)
+        previous_path = (
+            self._typed_root.parent / f"date={previous_date.isoformat()}" / "_NORMALIZED.json"
+        )
+        if not previous_path.exists():
+            return False
+        previous = orjson.loads(previous_path.read_bytes())
+        expected_symbols = previous.get("expected_symbols")
+        if not isinstance(expected_symbols, list) or any(
+            not isinstance(symbol, str) for symbol in expected_symbols
+        ):
+            raise ValueError(f"previous normalized universe is invalid: {previous_path}")
+        return self._symbol not in expected_symbols
 
     def _load_previous_checkpoint(self) -> L2CheckpointV1 | None:
         previous_date = self._date - timedelta(days=1)
@@ -426,10 +448,7 @@ class L2DayReconstructor:
             or checkpoint.exchange_symbol != self._symbol
         ):
             raise ValueError(f"previous L2 checkpoint identity mismatch: {path}")
-        if (
-            checkpoint.state is L2State.VALID
-            and checkpoint.valid_through_ns != self._day_start_ns
-        ):
+        if checkpoint.state is L2State.VALID and checkpoint.valid_through_ns != self._day_start_ns:
             raise ValueError(f"previous L2 checkpoint does not reach UTC boundary: {path}")
         return checkpoint
 
@@ -516,7 +535,7 @@ class L2DayReconstructor:
             sorted(
                 events,
                 key=lambda event: (
-                    event.observed_at_realtime_ns,
+                    _gap_effective_ns(event),
                     event.gap_id,
                     event.state,
                 ),
@@ -555,6 +574,12 @@ class L2DayReconstructor:
         )
 
 
+def _gap_effective_ns(event: GapEventV1) -> int:
+    if event.state is GapState.OPEN and event.affected_from_realtime_ns is not None:
+        return event.affected_from_realtime_ns
+    return event.observed_at_realtime_ns
+
+
 def _diff_from_row(row: dict[str, Any]) -> DepthDiff:
     return DepthDiff(
         connection_id=str(row["connection_id"]),
@@ -586,9 +611,7 @@ def _row_levels(values: list[dict[str, str]]) -> tuple[tuple[str, str], ...]:
 
 def _book_side(levels: tuple[tuple[str, str], ...]) -> dict[Decimal, Decimal]:
     return {
-        Decimal(price): Decimal(quantity)
-        for price, quantity in levels
-        if Decimal(quantity) != 0
+        Decimal(price): Decimal(quantity) for price, quantity in levels if Decimal(quantity) != 0
     }
 
 
@@ -644,9 +667,7 @@ def _diff_from_checkpoint(checkpoint: DepthDiffCheckpointV1) -> DepthDiff:
     )
 
 
-def _apply_levels(
-    side: dict[Decimal, Decimal], levels: tuple[tuple[str, str], ...]
-) -> None:
+def _apply_levels(side: dict[Decimal, Decimal], levels: tuple[tuple[str, str], ...]) -> None:
     for price_text, quantity_text in levels:
         price = Decimal(price_text)
         quantity = Decimal(quantity_text)

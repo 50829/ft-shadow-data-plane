@@ -63,9 +63,7 @@ def parse_typed_row(raw_row: dict[str, Any]) -> dict[str, Any] | None:
         "request_realtime_ns": raw_row.get("request_realtime_ns"),
         "exchange_event_time_ms": None,
         "exchange_transaction_time_ms": None,
-        "payload_hash": hashlib.sha256(
-            orjson.dumps(data, option=orjson.OPT_SORT_KEYS)
-        ).digest(),
+        "payload_hash": hashlib.sha256(orjson.dumps(data, option=orjson.OPT_SORT_KEYS)).digest(),
         "is_duplicate": False,
     }
 
@@ -178,10 +176,31 @@ def logical_identity(row: dict[str, Any]) -> tuple[object, ...] | None:
             int(row["first_update_id"]),
             int(row["final_update_id"]),
             int(row["previous_final_update_id"]),
-            bytes(row["payload_hash"]),
         )
     if stream is StreamType.BOOK_TICKER:
-        return stream, symbol, int(row["update_id"]), bytes(row["payload_hash"])
+        return stream, symbol, int(row["update_id"])
+    if stream is StreamType.MARK_PRICE:
+        return (
+            stream,
+            symbol,
+            int(row["exchange_event_time_ms"]),
+            bytes(row["payload_hash"]),
+        )
+    if stream is StreamType.FORCE_ORDER:
+        return (
+            stream,
+            symbol,
+            int(row["exchange_event_time_ms"]),
+            int(row["exchange_transaction_time_ms"]),
+            bytes(row["payload_hash"]),
+        )
+    if stream is StreamType.CONTRACT_INFO:
+        return (
+            stream,
+            symbol,
+            int(row["exchange_event_time_ms"]),
+            bytes(row["payload_hash"]),
+        )
     return None
 
 

@@ -32,9 +32,9 @@ RSYNC_GATEWAY_MODULE = _load_rsync_gateway()
 def test_vultr_config_is_formal_sixty_and_memory_bounded() -> None:
     config = load_edge_config(PROJECT_ROOT / "deploy/vultr/edge.yaml.example")
     compose = (PROJECT_ROOT / "deploy/vultr/compose.yaml").read_text(encoding="ascii")
-    service = (
-        PROJECT_ROOT / "deploy/vultr/systemd/ft-shadow-data-plane.service"
-    ).read_text(encoding="ascii")
+    service = (PROJECT_ROOT / "deploy/vultr/systemd/ft-shadow-data-plane.service").read_text(
+        encoding="ascii"
+    )
 
     role_sizes = (
         len(config.universe.core),
@@ -133,7 +133,7 @@ def test_submit_day_builds_dependency_chain(tmp_path: Path) -> None:
     _write_fake_sbatch(fake_bin / "sbatch")
     processing_env = _write_processing_env(tmp_path, concurrency=8)
     symbols = tmp_path / "symbols.txt"
-    symbols.write_text("BTCUSDT\nETHUSDT\n", encoding="ascii")
+    _write_symbols(symbols)
 
     result = subprocess.run(
         [str(SUBMIT_DAY), "2026-08-10", str(symbols)],
@@ -157,7 +157,7 @@ def test_submit_day_builds_dependency_chain(tmp_path: Path) -> None:
     calls = sbatch_log.read_text(encoding="ascii").splitlines()
     assert calls[0].endswith("/slurm/normalize.sbatch")
     assert "--dependency=afterok:101" in calls[1]
-    assert "--array=0-1%8" in calls[1]
+    assert "--array=0-59%8" in calls[1]
     assert calls[1].endswith("/slurm/l2-array.sbatch")
     assert "--dependency=afterok:102" in calls[2]
     assert calls[2].endswith("/slurm/finalize.sbatch")
@@ -170,7 +170,7 @@ def test_submit_day_rejects_duplicate_symbols(tmp_path: Path) -> None:
     _write_fake_sbatch(fake_bin / "sbatch")
     processing_env = _write_processing_env(tmp_path, concurrency=8)
     symbols = tmp_path / "symbols.txt"
-    symbols.write_text("BTCUSDT\nBTCUSDT\n", encoding="ascii")
+    _write_symbols(symbols, duplicate=True)
 
     result = subprocess.run(
         [str(SUBMIT_DAY), "2026-08-10", str(symbols)],
@@ -186,7 +186,7 @@ def test_submit_day_rejects_duplicate_symbols(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 1
-    assert "symbols must be unique" in result.stderr
+    assert "exactly 60 unique" in result.stderr
     assert not sbatch_log.exists()
 
 
@@ -197,10 +197,8 @@ def test_submit_day_rejects_out_of_order_checkpoint_processing(tmp_path: Path) -
     _write_fake_sbatch(fake_bin / "sbatch")
     processing_env = _write_processing_env(tmp_path, concurrency=8)
     symbols = tmp_path / "symbols.txt"
-    symbols.write_text("BTCUSDT\n", encoding="ascii")
-    previous_raw = (
-        tmp_path / "raw/collector=tokyo01/day-manifests/date=2026-08-09/SEALED.json"
-    )
+    _write_symbols(symbols)
+    previous_raw = tmp_path / "raw/collector=tokyo01/day-manifests/date=2026-08-09/SEALED.json"
     previous_raw.parent.mkdir(parents=True)
     previous_raw.write_text("{}", encoding="ascii")
     environment = {
@@ -255,6 +253,13 @@ def _write_processing_env(tmp_path: Path, *, concurrency: int) -> Path:
         encoding="ascii",
     )
     return path
+
+
+def _write_symbols(path: Path, *, duplicate: bool = False) -> None:
+    symbols = [f"S{index:03}USDT" for index in range(60)]
+    if duplicate:
+        symbols[-1] = symbols[0]
+    path.write_text("\n".join((*symbols, "")), encoding="ascii")
 
 
 def _write_fake_sbatch(path: Path) -> None:

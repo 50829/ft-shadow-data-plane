@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+import hashlib
+import heapq
 import os
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+import orjson
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from ft_shadow_data_plane.central.binance import logical_identity, parse_typed_row
-from ft_shadow_data_plane.contracts.models import ChunkManifestV1, ContentType, DayManifestV1
+from ft_shadow_data_plane.contracts.models import (
+    ChunkManifestV1,
+    ContentType,
+    DayManifestV1,
+    StreamType,
+    UniverseDecisionV1,
+)
 from ft_shadow_data_plane.contracts.schema import RAW_EVENT_SCHEMA_V1
 from ft_shadow_data_plane.contracts.serde import (
     atomic_write_bytes,
@@ -19,6 +28,8 @@ from ft_shadow_data_plane.contracts.serde import (
     sha256_file,
 )
 from ft_shadow_data_plane.contracts.typed_schema import TYPED_EVENT_SCHEMA_V1
+
+DEDUP_WINDOW_NS = 600 * 1_000_000_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,10 +51,7 @@ class DayNormalizer:
     ) -> None:
         self._collector_root = raw_root / f"collector={collector_id}"
         self._output_root = (
-            derived_root
-            / "typed"
-            / f"collector={collector_id}"
-            / f"date={utc_date.isoformat()}"
+            derived_root / "typed" / f"collector={collector_id}" / f"date={utc_date.isoformat()}"
         )
         self._utc_date = utc_date
         self._collector_id = collector_id
@@ -55,7 +63,9 @@ class DayNormalizer:
     def run(self) -> NormalizeResult:
         day_manifest = self._load_day_manifest()
         chunk_manifests = self._load_chunk_manifests(day_manifest)
-        seen: set[tuple[object, ...]] = set()
+        deduplicator = _Deduplicator.load(self._previous_dedup_checkpoint())
+        formal_starts: list[tuple[int, dict[str, Any], str]] = []
+        universe_events: list[tuple[UniverseDecisionV1, str]] = []
         raw_count = 0
         typed_count = 0
         duplicate_count = 0
@@ -76,16 +86,33 @@ class DayNormalizer:
             for batch in parquet.iter_batches(batch_size=10_000):
                 for raw_row in batch.to_pylist():
                     raw_count += 1
+                    stream_type = StreamType(str(raw_row["stream_type"]))
+                    if stream_type is StreamType.FORMAL_COLLECTION_STARTED:
+                        observed_ns = int(raw_row["app_receive_realtime_ns"])
+                        formal_starts.append(
+                            (
+                                observed_ns,
+                                _formal_start_payload(bytes(raw_row["payload_bytes"])),
+                                manifest.universe_hash,
+                            )
+                        )
+                    elif stream_type is StreamType.UNIVERSE_DECISION:
+                        decision = UniverseDecisionV1.model_validate_json(
+                            bytes(raw_row["payload_bytes"])
+                        )
+                        universe_events.append((decision, manifest.universe_hash))
                     typed = parse_typed_row(raw_row)
                     if typed is None:
                         continue
                     identity = logical_identity(typed)
                     if identity is not None:
-                        typed["is_duplicate"] = identity in seen
+                        typed["is_duplicate"] = deduplicator.observe(
+                            identity,
+                            bytes(typed["payload_hash"]),
+                            int(typed["app_receive_realtime_ns"]),
+                        )
                         if typed["is_duplicate"]:
                             duplicate_count += 1
-                        else:
-                            seen.add(identity)
                     rows.append(typed)
                     typed_count += 1
             if not rows:
@@ -94,6 +121,18 @@ class DayNormalizer:
             output_count += 1
 
         result = NormalizeResult(raw_count, typed_count, duplicate_count, output_count)
+        atomic_write_bytes(
+            self._output_root / "_DEDUP_CHECKPOINT.json",
+            canonical_json_bytes(deduplicator.checkpoint(day_end_ns=self._day_end_ns)),
+        )
+        formal_start = min(formal_starts, default=None, key=lambda item: item[0])
+        formal_start_ns = formal_start[0] if formal_start is not None else None
+        collection_window_start_ns = formal_start_ns or self._day_start_ns
+        active_universe = self._active_universe(universe_events, at_ns=collection_window_start_ns)
+        if formal_start is not None:
+            if active_universe is None:
+                raise ValueError("formal start has no active universe decision")
+            _validate_formal_start(formal_start, active_universe)
         marker = {
             "schema_version": 1,
             "collector_id": self._collector_id,
@@ -102,17 +141,46 @@ class DayNormalizer:
             "typed_events": result.typed_events,
             "duplicate_events": result.duplicate_events,
             "output_files": result.output_files,
+            "collection_window_start_ns": collection_window_start_ns,
+            "collection_window_end_ns": self._day_end_ns,
+            "formal_start_realtime_ns": formal_start_ns,
+            "formal_start_experiment_id": (
+                formal_start[1]["experiment_id"] if formal_start is not None else None
+            ),
+            "expected_symbols": (
+                list(active_universe.members) if active_universe is not None else None
+            ),
+            "generation": (active_universe.generation if active_universe is not None else None),
+            "universe_hash": (
+                active_universe.universe_hash if active_universe is not None else None
+            ),
+            "sealed_manifest_sha256": sha256_file(self._day_manifest_path()),
+            "dedup_window_ns": DEDUP_WINDOW_NS,
         }
         atomic_write_bytes(self._output_root / "_NORMALIZED.json", canonical_json_bytes(marker))
         return result
 
-    def _load_day_manifest(self) -> DayManifestV1:
-        path = (
-            self._collector_root
-            / "day-manifests"
-            / f"date={self._utc_date.isoformat()}"
-            / "SEALED.json"
+    @staticmethod
+    def _active_universe(
+        events: list[tuple[UniverseDecisionV1, str]], *, at_ns: int
+    ) -> UniverseDecisionV1 | None:
+        candidates = [
+            (decision, chunk_universe_hash)
+            for decision, chunk_universe_hash in events
+            if int(decision.effective_at.timestamp() * 1_000_000_000) <= at_ns
+        ]
+        if not candidates:
+            return None
+        decision, chunk_universe_hash = max(
+            candidates,
+            key=lambda item: (item[0].generation, item[0].effective_at),
         )
+        if decision.universe_hash != chunk_universe_hash:
+            raise ValueError("active universe event/chunk hash mismatch")
+        return decision
+
+    def _load_day_manifest(self) -> DayManifestV1:
+        path = self._day_manifest_path()
         if not path.exists():
             raise FileNotFoundError(f"sealed day manifest does not exist: {path}")
         manifest = DayManifestV1.model_validate_json(path.read_bytes())
@@ -120,9 +188,23 @@ class DayNormalizer:
             raise ValueError("sealed day manifest identity mismatch")
         return manifest
 
-    def _load_chunk_manifests(
-        self, day_manifest: DayManifestV1
-    ) -> list[ChunkManifestV1]:
+    def _day_manifest_path(self) -> Path:
+        return (
+            self._collector_root
+            / "day-manifests"
+            / f"date={self._utc_date.isoformat()}"
+            / "SEALED.json"
+        )
+
+    def _previous_dedup_checkpoint(self) -> Path:
+        previous_date = self._utc_date - timedelta(days=1)
+        return (
+            self._output_root.parent
+            / f"date={previous_date.isoformat()}"
+            / "_DEDUP_CHECKPOINT.json"
+        )
+
+    def _load_chunk_manifests(self, day_manifest: DayManifestV1) -> list[ChunkManifestV1]:
         manifests = []
         for chunk in day_manifest.chunks:
             data_path = self._collector_root / chunk.data_path
@@ -186,9 +268,7 @@ class DayNormalizer:
             or max_realtime_ns != manifest.max_app_receive_realtime_ns
         ):
             raise ValueError(f"raw receive time range mismatch: {path}")
-        if not (
-            self._day_start_ns <= min_realtime_ns <= max_realtime_ns < self._day_end_ns
-        ):
+        if not (self._day_start_ns <= min_realtime_ns <= max_realtime_ns < self._day_end_ns):
             raise ValueError(f"raw receive time range falls outside UTC date: {path}")
 
     @staticmethod
@@ -201,3 +281,101 @@ class DayNormalizer:
             os.fsync(source.fileno())
         partial.replace(path)
         fsync_directory(path.parent)
+
+
+class _Deduplicator:
+    def __init__(self) -> None:
+        self._seen: dict[str, tuple[bytes, int]] = {}
+        self._timeline: list[tuple[int, str]] = []
+        self._watermark_ns = 0
+
+    @classmethod
+    def load(cls, path: Path) -> _Deduplicator:
+        deduplicator = cls()
+        if not path.exists():
+            return deduplicator
+        value = orjson.loads(path.read_bytes())
+        if value.get("schema_version") != 1 or value.get("window_ns") != DEDUP_WINDOW_NS:
+            raise ValueError("incompatible dedup checkpoint")
+        for item in value.get("entries", []):
+            key = str(item["identity_key"])
+            payload_hash = bytes.fromhex(str(item["payload_hash"]))
+            observed_ns = int(item["observed_ns"])
+            deduplicator._seen[key] = (payload_hash, observed_ns)
+            heapq.heappush(deduplicator._timeline, (observed_ns, key))
+            deduplicator._watermark_ns = max(deduplicator._watermark_ns, observed_ns)
+        return deduplicator
+
+    def observe(self, identity: tuple[object, ...], payload_hash: bytes, observed_ns: int) -> bool:
+        self._watermark_ns = max(self._watermark_ns, observed_ns)
+        self._prune(self._watermark_ns - DEDUP_WINDOW_NS)
+        key = _identity_key(identity)
+        previous = self._seen.get(key)
+        if previous is not None and previous[0] != payload_hash:
+            raise ValueError(f"conflicting payload for logical event identity {key}")
+        duplicate = previous is not None
+        self._seen[key] = (payload_hash, observed_ns)
+        heapq.heappush(self._timeline, (observed_ns, key))
+        return duplicate
+
+    def checkpoint(self, *, day_end_ns: int) -> dict[str, Any]:
+        cutoff = day_end_ns - DEDUP_WINDOW_NS
+        entries = [
+            {
+                "identity_key": key,
+                "payload_hash": payload_hash.hex(),
+                "observed_ns": observed_ns,
+            }
+            for key, (payload_hash, observed_ns) in sorted(self._seen.items())
+            if observed_ns >= cutoff
+        ]
+        return {"schema_version": 1, "window_ns": DEDUP_WINDOW_NS, "entries": entries}
+
+    def _prune(self, cutoff_ns: int) -> None:
+        while self._timeline and self._timeline[0][0] < cutoff_ns:
+            observed_ns, key = heapq.heappop(self._timeline)
+            current = self._seen.get(key)
+            if current is not None and current[1] == observed_ns:
+                del self._seen[key]
+
+
+def _identity_key(identity: tuple[object, ...]) -> str:
+    normalized = [
+        {"bytes": value.hex()} if isinstance(value, bytes) else str(value) for value in identity
+    ]
+    return hashlib.sha256(orjson.dumps(normalized)).hexdigest()
+
+
+def _formal_start_payload(raw: bytes) -> dict[str, Any]:
+    value = orjson.loads(raw)
+    if not isinstance(value, dict) or value.get("event") != "FORMAL_COLLECTION_STARTED":
+        raise ValueError("invalid formal collection start event")
+    if not isinstance(value.get("experiment_id"), str) or not value["experiment_id"]:
+        raise ValueError("formal start has no experiment ID")
+    if (
+        not isinstance(value.get("generation"), int)
+        or isinstance(value["generation"], bool)
+        or value["generation"] < 1
+    ):
+        raise ValueError("formal start has an invalid generation")
+    if not isinstance(value.get("universe_hash"), str):
+        raise ValueError("formal start has no universe hash")
+    try:
+        started_at = datetime.fromisoformat(str(value["started_at"]))
+    except (KeyError, ValueError) as exc:
+        raise ValueError("formal start has an invalid started_at") from exc
+    if started_at.tzinfo is None or started_at.utcoffset() != UTC.utcoffset(started_at):
+        raise ValueError("formal start started_at must be UTC")
+    return value
+
+
+def _validate_formal_start(
+    evidence: tuple[int, dict[str, Any], str], active: UniverseDecisionV1
+) -> None:
+    _observed_ns, payload, chunk_universe_hash = evidence
+    if (
+        payload["generation"] != active.generation
+        or payload["universe_hash"] != active.universe_hash
+        or chunk_universe_hash != active.universe_hash
+    ):
+        raise ValueError("formal start/universe identity mismatch")

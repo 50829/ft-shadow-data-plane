@@ -18,10 +18,7 @@ def build_d0_audit(
     utc_date: date,
 ) -> Path:
     typed_root = (
-        derived_root
-        / "typed"
-        / f"collector={collector_id}"
-        / f"date={utc_date.isoformat()}"
+        derived_root / "typed" / f"collector={collector_id}" / f"date={utc_date.isoformat()}"
     )
     trade = {
         StreamType.TRADE: _trade_totals(),
@@ -31,10 +28,20 @@ def build_d0_audit(
         StreamType.DEPTH: {"events": 0, "level_updates": 0},
         StreamType.RPI_DEPTH: {"events": 0, "level_updates": 0},
     }
-    columns = ["stream_type", "price", "quantity", "non_rpi_quantity", "bids", "asks"]
+    columns = [
+        "stream_type",
+        "is_duplicate",
+        "price",
+        "quantity",
+        "non_rpi_quantity",
+        "bids",
+        "asks",
+    ]
     for path in sorted(typed_root.glob("*.typed.parquet")):
         for batch in pq.ParquetFile(path).iter_batches(batch_size=10_000, columns=columns):
             for row in batch.to_pylist():
+                if row["is_duplicate"]:
+                    continue
                 stream = StreamType(str(row["stream_type"]))
                 if stream in trade:
                     price = Decimal(str(row["price"]))
@@ -54,9 +61,7 @@ def build_d0_audit(
         "schema_version": 1,
         "collector_id": collector_id,
         "utc_date": utc_date.isoformat(),
-        "trade": {
-            stream.value: _serialize_totals(values) for stream, values in trade.items()
-        },
+        "trade": {stream.value: _serialize_totals(values) for stream, values in trade.items()},
         "depth": {stream.value: values for stream, values in depth.items()},
         "default_decision": {
             "official_trade_source": StreamType.AGG_TRADE.value,
@@ -85,7 +90,4 @@ def _trade_totals() -> dict[str, Any]:
 
 
 def _serialize_totals(values: dict[str, Any]) -> dict[str, int | str]:
-    return {
-        key: value if isinstance(value, int) else str(value)
-        for key, value in values.items()
-    }
+    return {key: value if isinstance(value, int) else str(value) for key, value in values.items()}
