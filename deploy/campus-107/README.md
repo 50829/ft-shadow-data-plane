@@ -1,95 +1,206 @@
-# 校园 107 拉取和处理
+# 校园 107 正式拉取与处理
 
-这个目录是校园 107 机器唯一需要阅读的部署入口。login node 每分钟执行一次短时 SFTP
-拉取；消耗 CPU 和内存的规范化及 L2 重建只能作为 Slurm job 运行。
+本机只运行每分钟一次的短时 rsync pull。CPU/内存较重的 normalize、L2 重建和 finalize
+只能提交到 Slurm。固定目录为：
 
-安装前必须获得校园管理员对 login-node cron 的正式许可。
+```text
+/home/scc/pb24000367/Projects/bn/ft-shadow-data-plane  仓库 checkout
+/home/scc/pb24000367/Projects/bn/runtime               程序、sandbox、日志、rsync 暂存
+/home/scc/pb24000367/Projects/bn/data/raw              永久原始数据
+/home/scc/pb24000367/Projects/bn/data/derived          Slurm 派生数据
+```
+
+`runtime/rsync` 只是远端镜像，可被后续同步清理。真正需要长期保留的是 `data/raw` 和
+`data/derived`。
 
 ## 1. 前置条件
 
-- Apptainer、Slurm 客户端命令、`flock` 和 OpenSSH 客户端；
-- 挂载在 `/persistent/ft-shadow-data-plane` 的持久存储；
-- Release 产物 `ft-shadow-data-plane.sif` 和
-  `ft-shadow-data-plane.sif.sha256`；
-- 已被 Vultr 的 `data-puller` 账户授权的私钥；
-- 通过独立渠道核对过的 Vultr SSH host key 指纹。
-
-## 2. 校验并安装 release
-
-在下载目录校验产物：
+确认管理员允许 login node 每分钟运行一次短时任务，并检查：
 
 ```bash
+module -t avail 2>&1 | grep apptainer
+/public/app/apptainer/1.4.5/bin/apptainer --version
+command -v crontab flock sbatch ssh
+```
+
+需要 v0.2 的仓库目录、`ft-shadow-data-plane.sif`、对应 SHA-256 文件，以及 Vultr 已授权的
+`~/.ssh/ft-data-puller` 私钥。
+
+## 2. clean start
+
+先从 `crontab -e` 删除旧 pull 行，再确认没有正在运行的 pull：
+
+```bash
+pgrep -af ft-data-pull || true
+```
+
+用户已明确不保留旧 runtime/raw/derived 时，先逐项解析：
+
+```bash
+for path in \
+  /home/scc/pb24000367/Projects/bn/runtime \
+  /home/scc/pb24000367/Projects/bn/data/raw \
+  /home/scc/pb24000367/Projects/bn/data/derived
+do
+  readlink -f "$path"
+done
+```
+
+人工核对后只删除上述三个目标。删除不可恢复，不要删除仓库和 `~/.ssh`：
+
+```bash
+rm -rf -- \
+  /home/scc/pb24000367/Projects/bn/runtime \
+  /home/scc/pb24000367/Projects/bn/data/raw \
+  /home/scc/pb24000367/Projects/bn/data/derived
+mkdir -p /home/scc/pb24000367/Projects/bn/data
+```
+
+## 3. 校验并安装 v0.2
+
+```bash
+cd /home/scc/pb24000367/Projects/bn/ft-shadow-data-plane
 sha256sum --check ft-shadow-data-plane.sif.sha256
+
+FT_CAMPUS_ROOT=/home/scc/pb24000367/Projects/bn/runtime \
+FT_DATA_ROOT=/home/scc/pb24000367/Projects/bn/data \
+FT_APPTAINER=/public/app/apptainer/1.4.5/bin/apptainer \
+  ./deploy/campus-107/install.sh ./ft-shadow-data-plane.sif
 ```
 
-然后使用生产账户，在仓库 checkout 根目录执行：
+安装器创建 hash-named SIF 和 sandbox，并令
+`runtime/ft-shadow-data-plane.sandbox` 指向当前版本。构建约占 306MiB，只在新 hash 首次安装
+时执行。`runtime/pull-once.sh` 安装为可执行文件。
+
+## 4. SSH host key 与 rsync
+
+`known_hosts` 必须只接受通过独立渠道从 Vultr 管理员取得的 ED25519 指纹。第一次可执行：
 
 ```bash
-./deploy/campus-107/install.sh /path/to/ft-shadow-data-plane.sif
+ssh-keyscan -p 22 -t ed25519 167.179.115.243 \
+  > /home/scc/pb24000367/.ssh/ft-shadow-data-plane.known_hosts.new
+ssh-keygen -lf \
+  /home/scc/pb24000367/.ssh/ft-shadow-data-plane.known_hosts.new
 ```
 
-安装器会把基于 hash 命名的不可变 SIF 和校园端脚本安装到
-`/persistent/ft-shadow-data-plane`，创建 `raw`、`derived` 和 `symbols` 目录，
-并且只在配置不存在时创建配置。它不会安装 cron，也不会连接 Vultr。
-
-## 3. 配置拉取和处理
-
-编辑：
-
-```text
-/persistent/ft-shadow-data-plane/central.yaml
-/persistent/ft-shadow-data-plane/deploy/campus-107/processing.env
-```
-
-`central.yaml` 配置 Vultr 地址、私钥、固定的 `known_hosts` 和本地 raw 路径。
-`processing.env` 配置 SIF、raw/derived 路径和 collector ID。所有路径都必须位于 login
-node 和 Slurm worker 共同可见的存储上。
-
-只有通过独立渠道比对 Vultr host key 指纹后，才能写入 `known_hosts`。禁止使用
-`AutoAddPolicy` 或关闭 host-key 检查。
-
-先执行本地检查和一次前台拉取：
+指纹完全匹配后再替换正式文件：
 
 ```bash
-/persistent/ft-shadow-data-plane/deploy/campus-107/verify.sh
-apptainer exec /persistent/ft-shadow-data-plane/ft-shadow-data-plane.sif \
-  ft-data-pull --config /persistent/ft-shadow-data-plane/central.yaml
+mv /home/scc/pb24000367/.ssh/ft-shadow-data-plane.known_hosts.new \
+  /home/scc/pb24000367/.ssh/ft-shadow-data-plane.known_hosts
+chmod 600 /home/scc/pb24000367/.ssh/ft-data-puller \
+  /home/scc/pb24000367/.ssh/ft-shadow-data-plane.known_hosts
 ```
 
-安装 cron 前，确认 raw chunk 已出现在 `/persistent/ft-shadow-data-plane/raw`，并且
-Vultr 上出现对应 ACK。
-
-## 4. 安装拉取 cron
-
-运行 `crontab -e`，添加以下文件中非注释的任务：
-
-```text
-/persistent/ft-shadow-data-plane/deploy/campus-107/crontab.example
-```
-
-puller 不能作为 login node 常驻服务运行。`flock` 用来防止相邻两分钟的任务重叠。
-
-## 5. 处理一个 sealed UTC 日
-
-创建 symbol 文件，每行只能有一个不重复的大写 Binance symbol，不能有空行：
-
-```text
-BTCUSDT
-ETHUSDT
-```
-
-一次提交 normalize、受并发限制的 L2 array 和 finalize：
+通过 sandbox 验证受限 rsync 只读列表：
 
 ```bash
-/persistent/ft-shadow-data-plane/deploy/campus-107/submit-day.sh \
-  2026-08-10 /persistent/ft-shadow-data-plane/symbols/2026-08-10.txt
+/public/app/apptainer/1.4.5/bin/apptainer exec --writable \
+  /home/scc/pb24000367/Projects/bn/runtime/ft-shadow-data-plane.sandbox \
+  rsync --list-only \
+  -e 'ssh -p 22 -i /home/scc/pb24000367/.ssh/ft-data-puller -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/home/scc/pb24000367/.ssh/ft-shadow-data-plane.known_hosts' \
+  data-puller@167.179.115.243:ready/
 ```
 
-脚本会根据 symbol 文件自动计算 Slurm array 范围并打印三个 job ID。只有
-`SEALED.json` 和它引用的全部 chunk 都已下载并通过 hash 校验后，才能提交当天任务。
+这里不应出现 shell prompt；远端 key 只允许 rrsync 协议。
 
-## 升级
+## 5. 配置文件
 
-校验新 SIF，使用新文件重新运行 `install.sh`，再运行 `verify.sh` 和一次前台 pull。
-安装器会保留现有 YAML 和环境配置，旧的 hash-named SIF 也会保留，避免影响正在运行的
-Slurm job。
+clean install 已生成 `runtime/central.yaml`。内容应与
+`deploy/campus-107/central.yaml.example` 一致，尤其核对：
+
+```yaml
+local_raw_root: /home/scc/pb24000367/Projects/bn/data/raw
+local_staging_root: /home/scc/pb24000367/Projects/bn/runtime/rsync
+client_key: /home/scc/pb24000367/.ssh/ft-data-puller
+known_hosts: /home/scc/pb24000367/.ssh/ft-shadow-data-plane.known_hosts
+```
+
+`runtime/deploy/campus-107/processing.env` 应使用绝对 Apptainer 路径、writable sandbox、上述
+raw/derived 和 `tokyo01`。赋值两侧不能有空格，含空格的值必须加引号。
+
+## 6. 前台验证和第一次拉取
+
+```bash
+FT_CAMPUS_ROOT=/home/scc/pb24000367/Projects/bn/runtime \
+  /home/scc/pb24000367/Projects/bn/runtime/deploy/campus-107/verify.sh
+
+/home/scc/pb24000367/Projects/bn/runtime/pull-once.sh
+```
+
+成功日志类似：
+
+```text
+pull complete new_chunks=<n> failures=0
+```
+
+检查永久数据而不是暂存目录：
+
+```bash
+du -sh /home/scc/pb24000367/Projects/bn/data/raw
+find /home/scc/pb24000367/Projects/bn/data/raw -type f | wc -l
+find /home/scc/pb24000367/Projects/bn/data/raw \
+  -path '*/collector=tokyo01/*' -type f | head
+```
+
+Vultr 上对应 chunk 的 ACK 到达后才会删除 ready 副本。
+
+## 7. 安装 cron
+
+`crontab` 是当前用户的定时任务表。以下任务每分钟尝试一次；`flock -n` 保证上一次未结束时
+不会再启动一个重叠进程。
+
+运行 `crontab -e`，加入：
+
+```cron
+SHELL=/bin/bash
+HOME=/home/scc/pb24000367
+PATH=/usr/local/bin:/usr/bin:/bin
+MAILTO=""
+R=/home/scc/pb24000367/Projects/bn/runtime
+
+* * * * * /usr/bin/flock -n "$R/pull.lock" "$R/pull-once.sh" >> "$R/logs/pull.log" 2>&1
+```
+
+保存后验证：
+
+```bash
+crontab -l | nl -ba
+sleep 70
+tail -n 50 /home/scc/pb24000367/Projects/bn/runtime/logs/pull.log
+pgrep -af ft-data-pull || true
+du -sh /home/scc/pb24000367/Projects/bn/data/raw
+```
+
+短时任务通常在检查时已经退出，所以 `pgrep` 没有输出不代表失败；以日志、raw 文件增长和
+Vultr ACK 为准。
+
+## 8. Slurm 处理
+
+当某天的 `SEALED.json` 和其引用的全部 chunk 已拉取后，准备当天 60 币文件，每行一个大写
+symbol，然后提交：
+
+```bash
+/home/scc/pb24000367/Projects/bn/runtime/deploy/campus-107/submit-day.sh \
+  2026-08-12 \
+  /home/scc/pb24000367/Projects/bn/runtime/symbols/2026-08-12.txt
+```
+
+脚本依次提交 normalize、受并发限制的 L2 array 和 finalize，并打印三个 job ID。检查：
+
+```bash
+squeue -u pb24000367
+sacct -j <job-id> --format=JobID,State,Elapsed,MaxRSS,ExitCode
+```
+
+## 9. 常见故障
+
+- `Permission denied (publickey)`：确认私钥名是 `ft-data-puller`，Vultr 已重新运行
+  `configure-rsync.sh`，并且命令含 `IdentitiesOnly=yes`；
+- host key 报错：不要关闭检查，重新从管理员渠道核对指纹；
+- `rrsync` 拒绝命令：Vultr 仍有旧 SSH Match 配置，或客户端使用了服务端删除/覆盖参数；
+- `apptainer: command not found`：只使用绝对路径，不依赖 cron 中的 module；
+- overlay `invalid argument`：确认镜像是 `.sandbox` 且命令包含 `exec --writable`；
+- `pull-once.sh: Permission denied`：重新运行 v0.2 installer，并检查 `stat -c '%A' runtime/pull-once.sh`；
+- raw 不增长：先看 `pull.log`，再看 `runtime/rsync/ready` 是否有 manifest，最后在 Vultr 检查
+  collector 是否仍写 `ready/`。

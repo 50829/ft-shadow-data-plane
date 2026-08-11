@@ -1,45 +1,21 @@
-# 部署
+# v0.2 端到端部署顺序
 
-生产系统分为两个明确的部署目标：
+正式链路必须按以下顺序上线，避免 collector 产生数据后没有可用的异地持久化端。
 
-```text
-Vultr edge
-  Binance -> collector -> Parquet/Zstd raw -> restricted SFTP
+1. 在 107 准备 `~/.ssh/ft-data-puller`，将公钥安全传给 Vultr 管理员；
+2. 在 Vultr 安装 `rsync`、`rrsync`、Docker 和 OpenSSH，运行 `deploy/vultr/install.sh`；
+3. Vultr 运行 `configure-rsync.sh` 安装 107 公钥，并独立核对 host-key 指纹；
+4. 在 107 安装 v0.2 SIF，安装器构建 hash-named writable sandbox；
+5. 107 配置 `central.yaml`，先用 `rsync --list-only` 和一次前台 pull 验证；
+6. 107 安装每分钟 cron，确认至少两个周期均成功；
+7. Vultr 写入 immutable image digest 和正式 60 币配置；
+8. 启动 collector，运行 `verify.sh`，等待日志中的 `FORMAL_COLLECTION_STARTED`；
+9. 确认 Vultr `ready/` 出现 chunk、107 `data/raw` 出现同一 chunk、Vultr 收到 ACK；
+10. 连续观察 24 小时资源指标、gap、ACK 延迟和剩余磁盘。
 
-Campus 107
-  minute cron pull -> persistent raw -> Slurm normalize/L2/finalize -> derived
-```
+详细命令分别见 [Vultr 手册](../deploy/vultr/README.md) 和
+[107 手册](../deploy/campus-107/README.md)。
 
-每台机器都有独立且自包含的部署入口：
-
-- Vultr 安装、SFTP 限制、启动、检查和升级：
-  [`deploy/vultr/README.md`](../deploy/vultr/README.md)
-- 校园 107 的 SIF、拉取 cron、Slurm 处理、检查和升级：
-  [`deploy/campus-107/README.md`](../deploy/campus-107/README.md)
-
-发布 tag 会生成 Vultr 使用的不可变 OCI image digest，以及校园使用的 SIF 和 SHA-256。
-不要从 `main` 临时构建生产版本，也不要在两台机器之间手工复制未校验的 Python 源码。
-
-生产前必须获得管理员对 login node 每分钟执行轻量 SFTP pull 的书面许可。pull 只执行
-下载、hash、fsync、rename 和 ACK；解析与 Parquet 处理全部进入 Slurm。
-
-Slurm 的 normalize、L2 array 和 finalize 依赖关系由校园部署目录中的 `submit-day.sh`
-统一生成。脚本根据 symbol 文件计算 array 上限，避免手工填写 `0-59` 一类容易出错的值。
-
-## Canary
-
-使用同一个 bootstrap decision 的嵌套 stage 文件，按 20、40、50、60 instruments 每级至少
-运行 24 小时，最后一级运行 72 小时。阶段间通过 `canary_scale` control 在 `00:00 UTC`
-生效，不使用 DAILY 或 `new_listing_probe` 绕过约束。依据日志
-检查 CPU、CPU steal、RSS、Arrow allocator、queue、event-loop lag、compressed bytes 和
-finalize latency。只有下式能在 25GB SSD 的可用空间内成立时才接受该磁盘：
-
-```text
-required_spool = 1.5 * max_rolling_6h_compressed_bytes
-```
-
-final stage 连续运行 72 小时并通过验收后，使用 bundle 中的 `steady-55.members.txt` 生成
-DAILY control；该变更一次移除 5 个 probe，且它们已经满足 48 小时最短停留要求。此后才
-允许通过 `new_listing_probe` 使用预留的 5 个空位。
-
-1C1G 失败则升级到 2C2G；磁盘失败则扩盘，不通过降低数据保真度过关。
+本版本没有旧状态迁移。若执行正式 clean start，必须先停 collector 和 107 cron，解析并人工
+核对每个绝对路径，再删除旧 `ready/writing/control` 与 107 的旧 `runtime/raw/derived`。
+这些删除不可恢复；仓库 checkout 和 SSH 私钥不在删除范围内。
