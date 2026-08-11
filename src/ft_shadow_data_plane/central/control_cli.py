@@ -4,50 +4,30 @@ import argparse
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ft_shadow_data_plane.contracts.models import ControlReason, UniverseControlV1
-from ft_shadow_data_plane.contracts.serde import (
-    atomic_write_bytes,
-    canonical_json_bytes,
-    universe_hash,
-)
+from ft_shadow_data_plane.contracts.models import CandidateOverrideV1
+from ft_shadow_data_plane.contracts.serde import atomic_write_bytes, canonical_json_bytes
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Create a versioned edge universe control")
+    parser = argparse.ArgumentParser(description="Create a candidate-only universe override")
     parser.add_argument("--generation", type=int, required=True)
     parser.add_argument("--effective-at", type=_utc_datetime, required=True)
-    parser.add_argument(
-        "--reason",
-        type=ControlReason,
-        choices=(
-            ControlReason.DAILY,
-            ControlReason.CANARY_SCALE,
-            ControlReason.NEW_LISTING_PROBE,
-        ),
-        required=True,
-    )
-    members_group = parser.add_mutually_exclusive_group(required=True)
-    members_group.add_argument("--members", help="comma-separated Binance symbols")
-    members_group.add_argument(
-        "--members-file", type=Path, help="one Binance symbol per line"
-    )
+    parser.add_argument("--boundary-file", type=Path, required=True)
+    parser.add_argument("--probe-file", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    raw_members = (
-        args.members.split(",")
-        if args.members is not None
-        else args.members_file.read_text(encoding="ascii").splitlines()
-    )
-    members = tuple(sorted(value.strip().upper() for value in raw_members if value.strip()))
-    control = UniverseControlV1(
+    override = CandidateOverrideV1(
         generation=args.generation,
         created_at=datetime.now(UTC),
         effective_at=args.effective_at,
-        reason=args.reason,
-        members=members,
-        universe_hash=universe_hash(members),
+        boundary=_members(args.boundary_file),
+        probe=_members(args.probe_file),
     )
-    atomic_write_bytes(args.output, canonical_json_bytes(control))
+    atomic_write_bytes(args.output, canonical_json_bytes(override))
+
+
+def _members(path: Path) -> tuple[str, ...]:
+    return tuple(sorted(value.strip().upper() for value in path.read_text().splitlines() if value))
 
 
 def _utc_datetime(value: str) -> datetime:

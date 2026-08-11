@@ -1,3 +1,5 @@
+name: ft-shadow-data-plane
+
 services:
   collector:
     image: ${EDGE_IMAGE:?EDGE_IMAGE must be an immutable image digest}
@@ -7,7 +9,7 @@ services:
     tmpfs:
       - /tmp:size=64m,mode=1777
     volumes:
-      - ${EDGE_DATA_ROOT:-/srv/ft-data-sftp}:/data
+      - ${EDGE_DATA_ROOT:-/srv/ft-data-rsync}:/data
       - ${EDGE_CONFIG:-/etc/ft-shadow-data-plane/edge.yaml}:/etc/ft-data/edge.yaml:ro
     cap_drop: ["ALL"]
     security_opt:
@@ -17,3 +19,8 @@ services:
     cpus: 0.90
     stop_grace_period: 2m
     restart: "no"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

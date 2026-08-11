@@ -58,6 +58,8 @@ class SpoolManager:
             ack = ACK_ADAPTER.validate_json(ack_path.read_bytes())
             item = manifests.get(ack.chunk_id)
             if item is None:
+                ack_path.unlink(missing_ok=True)
+                fsync_directory(ack_path.parent)
                 continue
             manifest_path, manifest = item
             if ack.sha256 != manifest.sha256:

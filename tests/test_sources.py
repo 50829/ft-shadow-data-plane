@@ -8,7 +8,7 @@ import aiohttp
 import pytest
 
 from ft_shadow_data_plane.contracts.models import GapReason, RawEventV1, StreamType
-from ft_shadow_data_plane.edge.binance import SourceIdentity
+from ft_shadow_data_plane.edge.binance import SourceIdentity, public_subscriptions
 from ft_shadow_data_plane.edge.sources import (
     ConnectionHandle,
     RestPollers,
@@ -113,6 +113,10 @@ async def test_open_interest_failure_is_tracked_per_symbol() -> None:
     ingest = FakeIngest(stop)
     gaps = FakeGaps()
     ready: list[str] = []
+
+    async def ignore_discovery(value: object) -> None:
+        return None
+
     pollers = RestPollers(
         config=SimpleNamespace(open_interest_interval_seconds=0.01),  # type: ignore[arg-type]
         instruments=("BTCUSDT", "ETHUSDT"),
@@ -124,6 +128,7 @@ async def test_open_interest_failure_is_tracked_per_symbol() -> None:
         rest=FakeRest(),  # type: ignore[arg-type]
         stop=stop,
         on_ready=ready.append,
+        on_discovery=ignore_discovery,
     )
 
     await asyncio.wait_for(pollers._open_interest_loop(), timeout=1)
@@ -145,6 +150,48 @@ async def test_open_interest_failure_is_tracked_per_symbol() -> None:
 def test_fixed_rate_deadline_skips_missed_slots_without_drifting() -> None:
     assert _advance_deadline(100.0, 30.0, 101.0) == 130.0
     assert _advance_deadline(100.0, 30.0, 170.0) == 190.0
+
+
+@pytest.mark.asyncio
+async def test_live_update_only_changes_replaced_symbol_subscriptions() -> None:
+    stop = asyncio.Event()
+    initial = tuple(f"S{index:03}USDT" for index in range(60))
+    proposed = tuple(sorted((*initial[:-1], "NEWUSDT")))
+    runner = RouteRunner(
+        name="public-0",
+        url="wss://example.invalid/stream",
+        subscriptions=public_subscriptions(initial, d0_enabled=False),
+        instruments=initial,
+        stream_types=(StreamType.BOOK_TICKER, StreamType.DEPTH),
+        collector_id="tokyo01",
+        boot_id="boot",
+        ingest=SimpleNamespace(),  # type: ignore[arg-type]
+        queues=FakeQueues(),  # type: ignore[arg-type]
+        gaps=SimpleNamespace(),  # type: ignore[arg-type]
+        rest=SimpleNamespace(),  # type: ignore[arg-type]
+        rotation_seconds=82_800,
+        overlap_seconds=15,
+        receive_timeout_seconds=30,
+        ping_interval_seconds=20,
+        ping_timeout_seconds=20,
+        service_stop=stop,
+        subscriptions_for=lambda values: public_subscriptions(values, d0_enabled=False),
+    )
+
+    updating = asyncio.create_task(runner.update_instruments(proposed))
+    update = await asyncio.wait_for(runner._updates.get(), timeout=0.5)
+    assert set(update.remove) == {
+        "s059usdt@bookTicker",
+        "s059usdt@depth@100ms",
+    }
+    assert set(update.add) == {
+        "newusdt@bookTicker",
+        "newusdt@depth@100ms",
+    }
+    assert update.snapshot_requests == (("NEWUSDT", StreamType.DEPTH_SNAPSHOT),)
+    update.completion.set_result(None)
+    await updating
+    assert runner.instruments == proposed
 
 
 @pytest.mark.asyncio

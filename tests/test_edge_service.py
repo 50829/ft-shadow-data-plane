@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
-from ft_shadow_data_plane.contracts.models import ControlReason
 from ft_shadow_data_plane.edge.service import EdgeService
 
 
@@ -13,32 +13,25 @@ class OnlineSources:
     running = True
 
     def __init__(self) -> None:
-        self.stop_calls = 0
-        self.start_calls: list[tuple[str, ...]] = []
+        self.updates: list[tuple[str, ...]] = []
 
-    async def stop(self) -> None:
-        self.stop_calls += 1
-
-    async def start(self, members: tuple[str, ...]) -> None:
-        self.start_calls.append(members)
-
-    async def wait_ready(self) -> None:
-        return None
+    async def update_instruments(self, members: tuple[str, ...]) -> None:
+        self.updates.append(members)
 
 
 class BoundaryGaps:
     def __init__(self) -> None:
-        self.open_calls = 0
-        self.close_calls = 0
+        self.opened_symbols: list[tuple[str, ...]] = []
+        self.closed_symbols: list[tuple[str, ...]] = []
         self.rollovers: list[datetime] = []
         self.universe_hashes: list[str] = []
 
     async def open(self, *args: object, **kwargs: object) -> str:
-        self.open_calls += 1
+        self.opened_symbols.append(kwargs["exchange_symbols"])  # type: ignore[arg-type]
         return "gap-boundary"
 
     async def close(self, *args: object, **kwargs: object) -> None:
-        self.close_calls += 1
+        self.closed_symbols.append(kwargs["exchange_symbols"])  # type: ignore[arg-type]
 
     async def rollover(self, boundary: datetime) -> None:
         self.rollovers.append(boundary)
@@ -47,16 +40,15 @@ class BoundaryGaps:
         self.universe_hashes.append(value)
 
 
-class NoChangeUniverse:
-    active = SimpleNamespace(members=("BTCUSDT",), universe_hash="a" * 64)
+class Universe:
+    def __init__(self, previous: object, decision: object | None) -> None:
+        self.active = previous
+        self._decision = decision
 
-    def apply_due(
-        self,
-        now: datetime,
-        *,
-        reasons: frozenset[ControlReason],
-    ) -> None:
-        return None
+    def apply_due(self, now: datetime) -> object | None:
+        if self._decision is not None:
+            self.active = self._decision
+        return self._decision
 
 
 class RecordingIngest:
@@ -69,35 +61,51 @@ class RecordingIngest:
 
 class RecordingDayIndex:
     def __init__(self) -> None:
-        self.seals: list[tuple[date, datetime]] = []
+        self.seals: list[date] = []
 
     async def seal(self, utc_date: date, *, sealed_at: datetime) -> None:
-        self.seals.append((utc_date, sealed_at))
+        self.seals.append(utc_date)
 
 
 @pytest.mark.asyncio
-async def test_midnight_without_universe_change_keeps_sources_online() -> None:
-    service = object.__new__(EdgeService)
-    service._sources = OnlineSources()  # type: ignore[attr-defined]
-    service._gaps = BoundaryGaps()  # type: ignore[attr-defined]
-    service._universe_store = NoChangeUniverse()  # type: ignore[attr-defined]
-    service._ingest = RecordingIngest()  # type: ignore[attr-defined]
-    service._day_index = RecordingDayIndex()  # type: ignore[attr-defined]
+async def test_midnight_without_change_keeps_all_sources_online() -> None:
+    previous = SimpleNamespace(members=_members(), universe_hash="a" * 64)
+    service = _service(previous, None)
     midnight = datetime(2026, 8, 11, tzinfo=UTC)
-    reasons = frozenset({ControlReason.DAILY, ControlReason.CANARY_SCALE})
 
-    await service._apply_midnight_boundary(
-        midnight,
-        reasons=reasons,
-        planned_transition=False,
-    )
+    await service._apply_midnight_boundary(midnight)
 
-    assert service._sources.stop_calls == 0  # type: ignore[attr-defined]
-    assert service._sources.start_calls == []  # type: ignore[attr-defined]
-    assert service._gaps.open_calls == 0  # type: ignore[attr-defined]
-    assert service._gaps.close_calls == 0  # type: ignore[attr-defined]
-    assert service._gaps.rollovers == [midnight]  # type: ignore[attr-defined]
+    assert service._sources.updates == []  # type: ignore[attr-defined]
+    assert service._gaps.opened_symbols == []  # type: ignore[attr-defined]
     assert service._ingest.rotations == ["a" * 64]  # type: ignore[attr-defined]
-    assert service._day_index.seals == [  # type: ignore[attr-defined]
-        (date(2026, 8, 10), midnight)
-    ]
+    assert service._day_index.seals == [date(2026, 8, 10)]  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_one_symbol_change_only_marks_changed_symbols() -> None:
+    previous_members = _members()
+    next_members = tuple(sorted((*previous_members[:-1], "NEWUSDT")))
+    previous = SimpleNamespace(members=previous_members, universe_hash="a" * 64)
+    decision = SimpleNamespace(members=next_members, universe_hash="b" * 64)
+    service = _service(previous, decision)
+
+    await service._apply_midnight_boundary(datetime(2026, 8, 11, tzinfo=UTC))
+
+    assert service._sources.updates == [next_members]  # type: ignore[attr-defined]
+    assert service._gaps.opened_symbols == [("NEWUSDT", previous_members[-1])]  # type: ignore[attr-defined]
+    assert service._gaps.closed_symbols == [("NEWUSDT", previous_members[-1])]  # type: ignore[attr-defined]
+    assert service._ingest.rotations == ["b" * 64]  # type: ignore[attr-defined]
+
+
+def _service(previous: object, decision: object | None) -> Any:
+    service: Any = object.__new__(EdgeService)
+    service._sources = OnlineSources()
+    service._gaps = BoundaryGaps()
+    service._universe_store = Universe(previous, decision)
+    service._ingest = RecordingIngest()
+    service._day_index = RecordingDayIndex()
+    return service
+
+
+def _members() -> tuple[str, ...]:
+    return tuple(f"S{index:03}USDT" for index in range(60))

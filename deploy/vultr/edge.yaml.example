@@ -1,50 +1,108 @@
 collector_id: tokyo01
 data_root: /data
-bootstrap_instruments:
-  # universe/bootstrap-2026-08-10T120017Z/stage-20.members.txt
-  - 1000PEPEUSDT
-  - ADAUSDT
-  - BEATUSDT
-  - BICOUSDT
-  - BMTUSDT
-  - BNBUSDT
-  - BTCUSDT
-  - CYSUSDT
-  - DOGEUSDT
-  - EPICUSDT
-  - ETHUSDT
-  - HYPEUSDT
-  - MUBARAKUSDT
-  - PUMPUSDT
-  - SOLUSDT
-  - TSTUSDT
-  - TUTUSDT
-  - WLDUSDT
-  - XRPUSDT
-  - ZECUSDT
+universe:
+  experiment_id: formal-60-2026-08-12
+  core:
+    - 1000PEPEUSDT
+    - ACEUSDT
+    - ACTUSDT
+    - ADAUSDT
+    - AVAXUSDT
+    - BANKUSDT
+    - BEATUSDT
+    - BICOUSDT
+    - BLESSUSDT
+    - BLUAIUSDT
+    - BMTUSDT
+    - BNBUSDT
+    - BOMEUSDT
+    - BTCUSDT
+    - BTWUSDT
+    - COOKIEUSDT
+    - CYSUSDT
+    - DOGEUSDT
+    - ENAUSDT
+    - EPICUSDT
+    - ETHUSDT
+    - GWEIUSDT
+    - HEIUSDT
+    - HYPEUSDT
+    - IOTXUSDT
+    - KAITOUSDT
+    - LINKUSDT
+    - MMTUSDT
+    - MUBARAKUSDT
+    - NEARUSDT
+    - NILUSDT
+    - ONDOUSDT
+    - ONUSDT
+    - PAXGUSDT
+    - PENGUUSDT
+    - PEOPLEUSDT
+    - PUMPUSDT
+    - SKYAIUSDT
+    - SOLUSDT
+    - SUIUSDT
+    - TAOUSDT
+    - TSTUSDT
+    - TUTUSDT
+    - UNIUSDT
+    - USUSDT
+    - WLDUSDT
+    - XANUSDT
+    - XMRUSDT
+    - XRPUSDT
+    - ZECUSDT
+  boundary:
+    - AAVEUSDT
+    - BANANAS31USDT
+    - ESPUSDT
+    - HOMEUSDT
+    - THEUSDT
+  probe:
+    - CAPUSDT
+    - DATAIPUSDT
+    - GRAMUSDT
+    - GRVTUSDT
+    - OUSDT
+  automation_enabled: true
+  discovery_hour_utc: 23
+  discovery_minute_utc: 50
+  decision_cutoff_minute_utc: 55
+  liquidity_window_days: 7
+  candidate_minimum_dwell_hours: 48
+  core_minimum_dwell_days: 14
+  candidate_daily_replacements: 2
+  core_weekly_replacements: 5
+  core_minimum_age_days: 30
+  core_entry_rank: 45
+  core_retain_rank: 55
+  boundary_retain_rank: 10
 public_ws_url: wss://fstream.binance.com/public/stream
 market_ws_url: wss://fstream.binance.com/market/stream
 rest_url: https://fapi.binance.com
-public_connection_shards: 4
+public_connection_shards: 2
 connection_rotation_seconds: 82800
 connection_overlap_seconds: 15
 websocket_receive_timeout_seconds: 30
 websocket_ping_interval_seconds: 20
 websocket_ping_timeout_seconds: 20
+websocket_max_queue: 4
+websocket_max_message_bytes: 2097152
+symbol_liveness_seconds: 120
 open_interest_interval_seconds: 30
-exchange_info_interval_seconds: 86400
 clock_sample_interval_seconds: 60
 snapshot_request_interval_seconds: 2.0
-queue_max_bytes: 134217728
+queue_max_bytes: 67108864
 queue_warn_ratio: 0.70
 queue_resume_ratio: 0.50
 chunk_max_seconds: 60
 chunk_max_bytes: 268435456
 chunk_max_events: 1000000
-writer_batch_events: 5000
-writer_batch_bytes: 4194304
+writer_batch_events: 2000
+writer_batch_bytes: 2097152
 spool_max_bytes: 10737418240
 minimum_free_bytes: 5368709120
 storage_check_seconds: 5
-control_poll_seconds: 30
+d0_enabled: false
 log_level: INFO

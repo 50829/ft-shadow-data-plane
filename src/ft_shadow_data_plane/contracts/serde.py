@@ -26,8 +26,15 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def universe_hash(members: tuple[str, ...]) -> str:
-    return sha256_bytes(orjson.dumps(list(members), option=orjson.OPT_SORT_KEYS))
+def universe_hash(
+    core: tuple[str, ...], boundary: tuple[str, ...], probe: tuple[str, ...]
+) -> str:
+    return sha256_bytes(
+        orjson.dumps(
+            {"boundary": list(boundary), "core": list(core), "probe": list(probe)},
+            option=orjson.OPT_SORT_KEYS,
+        )
+    )
 
 
 def fsync_directory(path: Path) -> None:

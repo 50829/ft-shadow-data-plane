@@ -17,7 +17,11 @@ class CentralConfig(BaseModel):
     remote_ready_root: str = "ready"
     remote_ack_root: str = "control/acks"
     local_raw_root: Path
+    local_staging_root: Path
     connect_timeout_seconds: int = Field(default=20, ge=1, le=120)
+    io_timeout_seconds: int = Field(default=120, ge=30, le=900)
+    rsync_binary: Path = Path("/usr/bin/rsync")
+    ssh_binary: Path = Path("/usr/bin/ssh")
 
 
 def load_central_config(path: Path) -> CentralConfig:

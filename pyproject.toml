@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ft-shadow-data-plane"
-version = "0.1.0"
+version = "0.2.0"
 description = "Loss-explicit Binance USD-M market data collection and reconstruction"
 readme = "README.md"
 license = { text = "GPL-3.0-only" }
@@ -12,7 +12,6 @@ requires-python = ">=3.12"
 dependencies = [
   "aiohttp>=3.11,<4",
   "orjson>=3.10,<4",
-  "paramiko>=3.5,<5",
   "pyarrow>=19,<22",
   "pydantic>=2.10,<3",
   "PyYAML>=6,<7",
@@ -61,6 +60,6 @@ plugins = ["pydantic.mypy"]
 mypy_path = ["src"]
 
 [[tool.mypy.overrides]]
-module = ["paramiko", "paramiko.*", "pyarrow", "pyarrow.*", "yaml"]
+module = ["pyarrow", "pyarrow.*", "yaml"]
 follow_imports = "skip"
 ignore_missing_imports = true

@@ -2,326 +2,340 @@ from __future__ import annotations
 
 import gzip
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 import orjson
 
-from ft_shadow_data_plane.contracts.models import CANARY_STAGE_SIZES, SYMBOL_PATTERN
+from ft_shadow_data_plane.contracts.models import SYMBOL_PATTERN, UniverseDecisionV1
 from ft_shadow_data_plane.contracts.serde import (
     atomic_write_bytes,
     canonical_json_bytes,
     sha256_bytes,
-    universe_hash,
 )
 
-EXCHANGE_INFO_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
-MARKET_TICKERS_URL = "https://fapi.binance.com/fapi/v1/ticker/24hr"
-@dataclass(frozen=True, slots=True)
-class BootstrapPolicy:
-    quote_asset: str = "USDT"
-    core_size: int = 50
-    boundary_size: int = 5
-    probe_size: int = 5
-    core_min_age_days: int = 30
 
-    def __post_init__(self) -> None:
-        if (self.core_size, self.boundary_size, self.probe_size) != (50, 5, 5):
-            raise ValueError("bootstrap policy must produce 50 core, 5 boundary, and 5 probes")
-        if self.core_min_age_days < 1:
-            raise ValueError("core_min_age_days must be positive")
+@dataclass(frozen=True, slots=True)
+class RollingPolicy:
+    liquidity_window_days: int = 7
+    candidate_minimum_dwell_hours: int = 48
+    core_minimum_dwell_days: int = 14
+    candidate_daily_replacements: int = 2
+    core_weekly_replacements: int = 5
+    core_minimum_age_days: int = 30
+    core_entry_rank: int = 45
+    core_retain_rank: int = 55
+    boundary_retain_rank: int = 10
 
 
 @dataclass(frozen=True, slots=True)
-class BootstrapSelection:
-    decision: dict[str, Any]
-    stages: dict[int, tuple[str, ...]]
-    steady_members: tuple[str, ...]
+class DiscoverySnapshot:
+    observed_at: datetime
+    exchange_info: bytes
+    exchange_info_confirmation: bytes
+    market_tickers: bytes
+
+    @property
+    def source_hashes(self) -> tuple[str, ...]:
+        return (
+            sha256_bytes(self.exchange_info),
+            sha256_bytes(self.exchange_info_confirmation),
+            sha256_bytes(self.market_tickers),
+        )
 
 
 @dataclass(frozen=True, slots=True)
-class _Candidate:
+class SelectionResult:
+    core: tuple[str, ...]
+    boundary: tuple[str, ...]
+    probe: tuple[str, ...]
+    inactive: tuple[str, ...]
+    source_hashes: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _MarketRow:
     symbol: str
     onboard_time_ms: int
-    quote_volume: Decimal
     age_days: int
+    mean_quote_volume: Decimal
+    sample_count: int
 
 
-def select_bootstrap_universe(
-    exchange_info_bytes: bytes,
-    market_tickers_bytes: bytes,
+def select_rolling_universe(
+    active: UniverseDecisionV1,
+    snapshots: tuple[DiscoverySnapshot, ...],
     *,
-    generated_at: datetime | None = None,
-    policy: BootstrapPolicy | None = None,
-) -> BootstrapSelection:
-    policy = policy or BootstrapPolicy()
-    generated_at = generated_at or datetime.now(UTC)
-    _require_utc(generated_at, "generated_at")
+    effective_at: datetime,
+    member_since: dict[str, datetime],
+    core_since: dict[str, datetime],
+    policy: RollingPolicy,
+) -> SelectionResult:
+    if not snapshots:
+        raise ValueError("at least one discovery snapshot is required")
+    latest = snapshots[-1]
+    first_info = _symbol_info(latest.exchange_info)
+    confirmed_info = _symbol_info(latest.exchange_info_confirmation)
+    ticker_history = [_tickers(item.market_tickers) for item in snapshots]
+    effective_ms = int(effective_at.timestamp() * 1000)
 
-    exchange_info = _json_object(exchange_info_bytes, "exchangeInfo")
-    ticker_rows = _json_array(market_tickers_bytes, "market tickers")
-    as_of_ms = _positive_int(exchange_info.get("serverTime"), "exchangeInfo.serverTime")
-    as_of = datetime.fromtimestamp(as_of_ms / 1000, UTC)
-    raw_symbols = exchange_info.get("symbols")
-    if not isinstance(raw_symbols, list):
-        raise ValueError("exchangeInfo.symbols must be an array")
+    eligible: dict[str, dict[str, Any]] = {}
+    inactive: list[str] = []
+    for symbol, raw in first_info.items():
+        confirmation = confirmed_info.get(symbol)
+        if confirmation is None:
+            continue
+        if _eligibility_reason(raw, symbol) is None and _eligibility_reason(
+            confirmation, symbol
+        ) is None:
+            eligible[symbol] = confirmation
+    for symbol in active.members:
+        if symbol not in eligible:
+            inactive.append(symbol)
 
-    tickers = _parse_tickers(ticker_rows)
-    candidates: list[_Candidate] = []
-    excluded: list[dict[str, str]] = []
-    seen_symbols: set[str] = set()
-    for index, raw_symbol in enumerate(raw_symbols):
-        if not isinstance(raw_symbol, dict):
-            raise ValueError(f"exchangeInfo.symbols[{index}] must be an object")
-        symbol = str(raw_symbol.get("symbol", ""))
-        reason = _eligibility_reason(raw_symbol, symbol, policy.quote_asset)
-        ticker = tickers.get(symbol)
-        if reason is None and ticker is None:
-            reason = "missing_ticker"
-        if reason is not None:
-            excluded.append({"symbol": symbol, "reason": reason})
+    rows: list[_MarketRow] = []
+    for symbol, raw in eligible.items():
+        volumes = [value[symbol] for value in ticker_history if symbol in value]
+        if not volumes:
             continue
-        if symbol in seen_symbols:
-            raise ValueError(f"exchangeInfo contains duplicate eligible symbol: {symbol}")
-        seen_symbols.add(symbol)
-        onboard_time_ms = _positive_int(
-            raw_symbol.get("onboardDate"), f"{symbol}.onboardDate"
-        )
-        if onboard_time_ms > as_of_ms:
-            excluded.append({"symbol": symbol, "reason": "future_onboard_date"})
+        onboard_ms = _positive_int(raw.get("onboardDate"), f"{symbol}.onboardDate")
+        if onboard_ms > effective_ms:
             continue
-        quote_volume = _quote_volume(ticker, symbol)
-        if quote_volume is None:
-            excluded.append({"symbol": symbol, "reason": "invalid_quote_volume"})
-            continue
-        candidates.append(
-            _Candidate(
+        rows.append(
+            _MarketRow(
                 symbol=symbol,
-                onboard_time_ms=onboard_time_ms,
-                quote_volume=quote_volume,
-                age_days=(as_of_ms - onboard_time_ms) // 86_400_000,
+                onboard_time_ms=onboard_ms,
+                age_days=(effective_ms - onboard_ms) // 86_400_000,
+                mean_quote_volume=sum(volumes, Decimal()) / len(volumes),
+                sample_count=len(volumes),
             )
         )
+    liquidity = sorted(rows, key=lambda item: (-item.mean_quote_volume, item.symbol))
+    rank = {item.symbol: index for index, item in enumerate(liquidity, start=1)}
+    core = list(active.core)
+    forced_core = [symbol for symbol in core if symbol in inactive]
+    replacement_pool = [
+        item.symbol
+        for item in liquidity
+        if item.symbol not in core
+        and item.age_days >= policy.core_minimum_age_days
+        and item.sample_count == len(snapshots)
+    ]
+    for symbol in forced_core:
+        replacement = _take_first(replacement_pool, forbidden=set(core))
+        if replacement is None:
+            break
+        core[core.index(symbol)] = replacement
 
-    probes = sorted(
-        candidates,
-        key=lambda item: (-item.onboard_time_ms, -item.quote_volume, item.symbol),
-    )[: policy.probe_size]
-    probe_symbols = {item.symbol for item in probes}
-    mature = [
-        item
-        for item in candidates
-        if item.symbol not in probe_symbols and item.age_days >= policy.core_min_age_days
-    ]
-    liquidity_ranked = sorted(mature, key=lambda item: (-item.quote_volume, item.symbol))
-    required_mature = policy.core_size + policy.boundary_size
-    if len(liquidity_ranked) < required_mature or len(probes) < policy.probe_size:
-        raise ValueError("not enough eligible contracts to build the bootstrap universe")
-    core = liquidity_ranked[: policy.core_size]
-    boundary = liquidity_ranked[policy.core_size : required_mature]
+    is_weekly = effective_at.weekday() == 0 and len(snapshots) >= policy.liquidity_window_days
+    if is_weekly:
+        changes = len(set(active.core) - set(core))
+        promotable = [
+            symbol
+            for symbol in replacement_pool
+            if symbol not in core
+            if rank.get(symbol, 10**9) <= policy.core_entry_rank
+        ]
+        while promotable and changes < policy.core_weekly_replacements:
+            challenger = promotable.pop(0)
+            removable = [
+                symbol
+                for symbol in core
+                if rank.get(symbol, 10**9) > policy.core_retain_rank
+                if _dwell_complete(
+                    core_since.get(symbol, active.effective_at),
+                    effective_at,
+                    timedelta(days=policy.core_minimum_dwell_days),
+                )
+            ]
+            if not removable:
+                break
+            incumbent = max(removable, key=lambda symbol: rank.get(symbol, 10**9))
+            if rank.get(challenger, 10**9) >= rank.get(incumbent, 10**9):
+                break
+            core[core.index(incumbent)] = challenger
+            changes += 1
 
-    core_symbols = tuple(item.symbol for item in core)
-    boundary_symbols = tuple(item.symbol for item in boundary)
-    probe_symbols_ordered = tuple(item.symbol for item in probes)
-    stage_members = {
-        20: tuple(sorted(core_symbols[:20])),
-        40: tuple(sorted(core_symbols[:40])),
-        50: tuple(sorted(core_symbols)),
-        60: tuple(sorted((*core_symbols, *boundary_symbols, *probe_symbols_ordered))),
-    }
-    steady_members = tuple(sorted((*core_symbols, *boundary_symbols)))
-    selected_bucket = {
-        **{symbol: "core" for symbol in core_symbols},
-        **{symbol: "boundary" for symbol in boundary_symbols},
-        **{symbol: "probe" for symbol in probe_symbols_ordered},
-    }
-    global_ranked = sorted(candidates, key=lambda item: (-item.quote_volume, item.symbol))
-    candidate_rows = [
-        {
-            "symbol": item.symbol,
-            "quote_volume_24h": str(item.quote_volume),
-            "onboard_at": datetime.fromtimestamp(item.onboard_time_ms / 1000, UTC).isoformat(),
-            "age_days": item.age_days,
-            "liquidity_rank": rank,
-            "selected_bucket": selected_bucket.get(item.symbol),
-        }
-        for rank, item in enumerate(global_ranked, start=1)
+    core_set = set(core)
+    newest = sorted(
+        (item for item in rows if item.symbol not in core_set),
+        key=lambda item: (-item.onboard_time_ms, -item.mean_quote_volume, item.symbol),
+    )
+    probe_preferred = [item.symbol for item in newest]
+    probe = _reconcile_bucket(
+        active.probe,
+        probe_preferred,
+        forbidden=core_set,
+        inactive=set(inactive),
+        member_since=member_since,
+        effective_at=effective_at,
+        minimum_dwell=timedelta(hours=policy.candidate_minimum_dwell_hours),
+        normal_replacement_limit=1,
+    )
+
+    probe_set = set(probe)
+    boundary_ranked = [
+        item.symbol
+        for item in liquidity
+        if item.symbol not in core_set and item.symbol not in probe_set
     ]
-    excluded.sort(key=lambda item: (item["reason"], item["symbol"]))
-    exclusion_counts: dict[str, int] = {}
-    for item in excluded:
-        reason = item["reason"]
-        exclusion_counts[reason] = exclusion_counts.get(reason, 0) + 1
-    stages = [
-        {
-            "target_size": size,
-            "members": list(stage_members[size]),
-            "universe_hash": universe_hash(stage_members[size]),
-        }
-        for size in CANARY_STAGE_SIZES
-    ]
-    decision: dict[str, Any] = {
-        "schema_version": 1,
-        "decision_type": "bootstrap",
-        "generated_at": generated_at.isoformat(),
-        "as_of": as_of.isoformat(),
-        "sources": {
-            "exchange_info": {
-                "url": EXCHANGE_INFO_URL,
-                "artifact": "sources/exchange-info.json.gz",
-                "payload_sha256": sha256_bytes(exchange_info_bytes),
-            },
-            "market_tickers": {
-                "url": MARKET_TICKERS_URL,
-                "artifact": "sources/market-tickers.json.gz",
-                "payload_sha256": sha256_bytes(market_tickers_bytes),
-            },
-        },
-        "policy": {
-            "contract_type": "PERPETUAL",
-            "status": "TRADING",
-            "quote_asset": policy.quote_asset,
-            "margin_asset": policy.quote_asset,
-            "core_size": policy.core_size,
-            "boundary_size": policy.boundary_size,
-            "probe_size": policy.probe_size,
-            "core_min_age_days": policy.core_min_age_days,
-            "liquidity_metric": "single_snapshot_24h_quote_volume",
-            "probe_order": "newest_onboard_date_then_quote_volume",
-            "limitation": (
-                "Bootstrap has one 24h snapshot; daily selection must use retained history "
-                "before claiming a 7-day liquidity statistic."
-            ),
-        },
-        "counts": {
-            "exchange_symbols": len(raw_symbols),
-            "ticker_symbols": len(tickers),
-            "eligible_symbols": len(candidates),
-            "excluded_symbols": len(excluded),
-            "exclusion_reasons": dict(sorted(exclusion_counts.items())),
-        },
-        "buckets": {
-            "core": list(core_symbols),
-            "boundary": list(boundary_symbols),
-            "probe": list(probe_symbols_ordered),
-        },
-        "stages": stages,
-        "steady_state": {
-            "target_size": len(steady_members),
-            "members": list(steady_members),
-            "universe_hash": universe_hash(steady_members),
-            "reserved_probe_slots": policy.probe_size,
-        },
-        "candidates": candidate_rows,
-        "excluded": excluded,
+    protected_boundary = {
+        symbol
+        for symbol in active.boundary
+        if symbol not in inactive
+        and symbol not in core_set
+        and symbol not in probe_set
+        and rank.get(symbol, 10**9) <= policy.boundary_retain_rank
     }
-    return BootstrapSelection(
-        decision=decision,
-        stages=stage_members,
-        steady_members=steady_members,
+    boundary_preferred = [*sorted(protected_boundary), *boundary_ranked]
+    boundary = _reconcile_bucket(
+        active.boundary,
+        boundary_preferred,
+        forbidden=core_set | probe_set,
+        inactive=set(inactive),
+        member_since=member_since,
+        effective_at=effective_at,
+        minimum_dwell=timedelta(hours=policy.candidate_minimum_dwell_hours),
+        normal_replacement_limit=max(1, policy.candidate_daily_replacements - 1),
+    )
+
+    source_hashes = tuple(value for item in snapshots for value in item.source_hashes)
+    return SelectionResult(
+        core=tuple(sorted(core)),
+        boundary=tuple(sorted(boundary)),
+        probe=tuple(sorted(probe)),
+        inactive=tuple(sorted(inactive)),
+        source_hashes=source_hashes,
     )
 
 
-def write_bootstrap_bundle(
-    selection: BootstrapSelection,
+def write_formal_bundle(
+    decision: UniverseDecisionV1,
     output_dir: Path,
     *,
-    exchange_info_bytes: bytes,
-    market_tickers_bytes: bytes,
+    snapshot: DiscoverySnapshot,
 ) -> None:
+    atomic_write_bytes(output_dir / "decision.json", canonical_json_bytes(decision), mode=0o644)
     atomic_write_bytes(
-        output_dir / "decision.json", canonical_json_bytes(selection.decision), mode=0o644
-    )
-    atomic_write_bytes(
-        output_dir / "sources" / "exchange-info.json.gz",
-        gzip.compress(exchange_info_bytes, mtime=0),
+        output_dir / "formal-60.members.txt",
+        ("\n".join(decision.members) + "\n").encode("ascii"),
         mode=0o644,
     )
-    atomic_write_bytes(
-        output_dir / "sources" / "market-tickers.json.gz",
-        gzip.compress(market_tickers_bytes, mtime=0),
-        mode=0o644,
-    )
-    for size in CANARY_STAGE_SIZES:
-        members = selection.stages[size]
+    for name, content in (
+        ("exchange-info.json.gz", snapshot.exchange_info),
+        ("exchange-info-confirmation.json.gz", snapshot.exchange_info_confirmation),
+        ("market-tickers.json.gz", snapshot.market_tickers),
+    ):
         atomic_write_bytes(
-            output_dir / f"stage-{size}.members.txt",
-            ("\n".join(members) + "\n").encode("ascii"),
+            output_dir / "sources" / name,
+            gzip.compress(content, mtime=0),
             mode=0o644,
         )
-    atomic_write_bytes(
-        output_dir / "steady-55.members.txt",
-        ("\n".join(selection.steady_members) + "\n").encode("ascii"),
-        mode=0o644,
-    )
 
 
-def _parse_tickers(rows: list[Any]) -> dict[str, dict[str, Any]]:
-    tickers: dict[str, dict[str, Any]] = {}
-    for index, row in enumerate(rows):
-        if not isinstance(row, dict):
-            raise ValueError(f"market tickers[{index}] must be an object")
-        symbol = row.get("symbol")
-        if not isinstance(symbol, str) or not symbol:
-            raise ValueError(f"market tickers[{index}] has no symbol")
-        if symbol in tickers:
-            raise ValueError(f"market tickers contains duplicate symbol: {symbol}")
-        tickers[symbol] = row
-    return tickers
+def _reconcile_bucket(
+    current: tuple[str, ...],
+    preferred: list[str],
+    *,
+    forbidden: set[str],
+    inactive: set[str],
+    member_since: dict[str, datetime],
+    effective_at: datetime,
+    minimum_dwell: timedelta,
+    normal_replacement_limit: int,
+) -> tuple[str, ...]:
+    preferred = list(dict.fromkeys(symbol for symbol in preferred if symbol not in forbidden))
+    result = [symbol for symbol in current if symbol not in forbidden and symbol not in inactive]
+    forced_vacancies = 5 - len(result)
+    for symbol in preferred:
+        if len(result) >= 5:
+            break
+        if symbol not in result:
+            result.append(symbol)
+    normal_changes = 0
+    for symbol in preferred:
+        if symbol in result or normal_changes >= normal_replacement_limit:
+            continue
+        removable = [
+            incumbent
+            for incumbent in result
+            if incumbent not in preferred[:5]
+            and _dwell_complete(
+                member_since.get(incumbent, effective_at), effective_at, minimum_dwell
+            )
+        ]
+        if not removable:
+            continue
+        result.remove(removable[-1])
+        result.append(symbol)
+        normal_changes += 1
+    if len(result) != 5:
+        raise ValueError("not enough eligible instruments to fill candidate role")
+    if forced_vacancies == 0 and len(set(current) - set(result)) > normal_replacement_limit:
+        raise ValueError("candidate replacement limit exceeded")
+    return tuple(sorted(result))
 
 
-def _eligibility_reason(raw: dict[str, Any], symbol: str, quote_asset: str) -> str | None:
+def _take_first(values: list[str], *, forbidden: set[str]) -> str | None:
+    return next((value for value in values if value not in forbidden), None)
+
+
+def _dwell_complete(joined: datetime, effective: datetime, required: timedelta) -> bool:
+    return joined <= effective - required
+
+
+def _symbol_info(raw: bytes) -> dict[str, dict[str, Any]]:
+    payload = orjson.loads(raw)
+    if not isinstance(payload, dict) or not isinstance(payload.get("symbols"), list):
+        raise ValueError("exchangeInfo must contain a symbols array")
+    result: dict[str, dict[str, Any]] = {}
+    for value in payload["symbols"]:
+        if not isinstance(value, dict) or not isinstance(value.get("symbol"), str):
+            raise ValueError("exchangeInfo contains an invalid symbol row")
+        symbol = str(value["symbol"])
+        if symbol in result:
+            raise ValueError(f"exchangeInfo contains duplicate symbol: {symbol}")
+        result[symbol] = value
+    return result
+
+
+def _tickers(raw: bytes) -> dict[str, Decimal]:
+    payload = orjson.loads(raw)
+    if not isinstance(payload, list):
+        raise ValueError("market tickers must be an array")
+    result: dict[str, Decimal] = {}
+    for value in payload:
+        if not isinstance(value, dict) or not isinstance(value.get("symbol"), str):
+            raise ValueError("market tickers contains an invalid row")
+        symbol = str(value["symbol"])
+        try:
+            volume = Decimal(str(value["quoteVolume"]))
+        except (InvalidOperation, KeyError) as exc:
+            raise ValueError(f"invalid quote volume for {symbol}") from exc
+        if not volume.is_finite() or volume < 0:
+            raise ValueError(f"invalid quote volume for {symbol}")
+        result[symbol] = volume
+    return result
+
+
+def _eligibility_reason(raw: dict[str, Any], symbol: str) -> str | None:
     if raw.get("status") != "TRADING":
         return "not_trading"
     if raw.get("contractType") != "PERPETUAL":
         return "not_perpetual"
-    if raw.get("quoteAsset") != quote_asset or raw.get("marginAsset") != quote_asset:
-        return "not_target_quote_or_margin_asset"
+    if raw.get("quoteAsset") != "USDT" or raw.get("marginAsset") != "USDT":
+        return "not_usdt"
     if not SYMBOL_PATTERN.fullmatch(symbol):
         return "invalid_symbol"
     return None
 
 
-def _quote_volume(ticker: dict[str, Any] | None, symbol: str) -> Decimal | None:
-    if ticker is None:
-        return None
-    try:
-        value = Decimal(str(ticker["quoteVolume"]))
-    except (InvalidOperation, KeyError):
-        return None
-    if not value.is_finite() or value < 0:
-        return None
-    return value
-
-
-def _json_object(raw: bytes, label: str) -> dict[str, Any]:
-    value: Any = orjson.loads(raw)
-    if not isinstance(value, dict):
-        raise ValueError(f"{label} must be an object")
-    return value
-
-
-def _json_array(raw: bytes, label: str) -> list[Any]:
-    value: Any = orjson.loads(raw)
-    if not isinstance(value, list):
-        raise ValueError(f"{label} must be an array")
-    return value
-
-
 def _positive_int(value: object, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, str)):
         raise ValueError(f"{label} must be a positive integer")
-    try:
-        parsed = int(value)
-    except ValueError as exc:
-        raise ValueError(f"{label} must be a positive integer") from exc
+    parsed = int(value)
     if parsed <= 0:
         raise ValueError(f"{label} must be a positive integer")
     return parsed
-
-
-def _require_utc(value: datetime, label: str) -> None:
-    if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
-        raise ValueError(f"{label} must be UTC")

@@ -32,9 +32,13 @@ def parse_typed_row(raw_row: dict[str, Any]) -> dict[str, Any] | None:
         value = orjson.loads(bytes(raw_row["payload_bytes"]))
         if stream is StreamType.MARKET_TICKERS and not isinstance(value, list):
             raise ValueError("market tickers payload must be an array")
-        if stream in {StreamType.EXCHANGE_INFO, StreamType.WS_CONTROL} and not isinstance(
-            value, dict
-        ):
+        object_streams = {
+            StreamType.EXCHANGE_INFO,
+            StreamType.FORMAL_COLLECTION_STARTED,
+            StreamType.UNIVERSE_DECISION,
+            StreamType.WS_CONTROL,
+        }
+        if stream in object_streams and not isinstance(value, dict):
             raise ValueError(f"{stream.value} payload must be an object")
         return None
     payload = _json_object(bytes(raw_row["payload_bytes"]))

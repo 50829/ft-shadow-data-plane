@@ -5,19 +5,23 @@ import logging
 import os
 import resource
 import shutil
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
 import pyarrow as pa
 
+from ft_shadow_data_plane.central.selector import DiscoverySnapshot
 from ft_shadow_data_plane.contracts.data_contract import data_contract_hash_v1
 from ft_shadow_data_plane.contracts.models import (
-    ControlReason,
     GapEventV1,
     GapReason,
+    StreamType,
     WriterGroup,
 )
+from ft_shadow_data_plane.contracts.serde import atomic_write_bytes, canonical_json_bytes
+from ft_shadow_data_plane.edge.binance import SourceIdentity
 from ft_shadow_data_plane.edge.config import EdgeConfig
 from ft_shadow_data_plane.edge.day_index import DayIndex
 from ft_shadow_data_plane.edge.gaps import GapJournal
@@ -43,13 +47,9 @@ class EdgeService:
             max_bytes=config.spool_max_bytes,
             minimum_free_bytes=config.minimum_free_bytes,
         )
-        self._universe_store = UniverseStore(
-            config.data_root, config.bootstrap_instruments
-        )
+        self._universe_store = UniverseStore(config.data_root, config.universe)
         active = self._universe_store.initialize()
-        active = self._universe_store.apply_due(
-            reasons=frozenset({ControlReason.DAILY, ControlReason.CANARY_SCALE})
-        ) or active
+        active = self._universe_store.apply_due() or active
         data_contract_hash = data_contract_hash_v1(
             d0_enabled=config.d0_enabled,
             open_interest_interval_seconds=config.open_interest_interval_seconds,
@@ -90,7 +90,15 @@ class EdgeService:
             ingest=self._ingest,
             queues=self._queues,
             gaps=self._gaps,
+            on_discovery=self._on_discovery,
         )
+        self._control_identity = SourceIdentity(
+            config.collector_id,
+            self._boot_id,
+            uuid4().hex,
+            f"edge-control-{uuid4().hex}",
+        )
+        self._formal_start_path = config.data_root / "control" / "formal-start.json"
         self._storage_gap_id: str | None = None
         self._stale_gaps: tuple[GapEventV1, ...] = ()
         self._previous_cpu = _host_cpu_sample()
@@ -115,6 +123,7 @@ class EdgeService:
                 await self._sources.wait_ready()
                 await self._close_stale_gaps()
                 await self._seal_completed_days()
+                await self._mark_formal_start()
         except BaseException:
             await self._sources.stop()
             await self._writers.stop()
@@ -123,7 +132,6 @@ class EdgeService:
         background = [
             asyncio.create_task(self._storage_loop(), name="storage-monitor"),
             asyncio.create_task(self._midnight_loop(), name="utc-midnight-rotation"),
-            asyncio.create_task(self._control_loop(), name="universe-control"),
             asyncio.create_task(self._stats_loop(), name="collector-stats"),
             asyncio.create_task(self._writers.wait_for_failure(), name="writer-health"),
         ]
@@ -177,6 +185,7 @@ class EdgeService:
                     await self._sources.wait_ready()
                     await self._close_stale_gaps()
                     await self._seal_completed_days()
+                    await self._mark_formal_start()
                     await self._gaps.close(
                         self._storage_gap_id,
                         GapReason.STORAGE_EXHAUSTED,
@@ -189,99 +198,104 @@ class EdgeService:
         while not self._stop.is_set():
             now = datetime.now(UTC)
             midnight = datetime.combine(now.date() + timedelta(days=1), datetime.min.time(), UTC)
-            pre_boundary = max(0.0, (midnight - now).total_seconds() - 2.0)
-            await _wait_event(self._stop, pre_boundary)
+            await _wait_event(self._stop, max(0.0, (midnight - now).total_seconds()))
             if self._stop.is_set():
                 return
-            reasons = frozenset({ControlReason.DAILY, ControlReason.CANARY_SCALE})
-            planned_transition = self._universe_store.has_due(midnight, reasons=reasons)
-            if not planned_transition:
-                # Keep ingest online and let pre-midnight callbacks drain before sealing.
-                await _sleep_until(midnight + timedelta(seconds=2))
-                if self._stop.is_set():
-                    return
             async with self._operation_lock:
-                await self._apply_midnight_boundary(
-                    midnight,
-                    reasons=reasons,
-                    planned_transition=planned_transition,
-                )
+                await self._apply_midnight_boundary(midnight)
 
-    async def _apply_midnight_boundary(
-        self,
-        midnight: datetime,
-        *,
-        reasons: frozenset[ControlReason],
-        planned_transition: bool,
-    ) -> None:
+    async def _apply_midnight_boundary(self, midnight: datetime) -> None:
+        previous = self._universe_store.active
         was_running = self._sources.running
         boundary_gap: str | None = None
-        stopped_for_transition = False
-        if planned_transition and was_running:
-            boundary_gap = await self._gaps.open(
-                GapReason.PLANNED_BOUNDARY,
-                exchange_symbols=self._universe_store.active.members,
-                detail="UTC midnight universe transition",
-            )
-            await self._sources.stop()
-            stopped_for_transition = True
         await _sleep_until(midnight)
         previous_date = midnight.date() - timedelta(days=1)
         await self._gaps.rollover(midnight)
-        control = self._universe_store.apply_due(midnight, reasons=reasons)
-        active = control or self._universe_store.active
-        if control is not None and was_running and not stopped_for_transition:
-            boundary_gap = await self._gaps.open(
-                GapReason.PLANNED_BOUNDARY,
-                exchange_symbols=self._universe_store.active.members,
-                detail="late UTC midnight universe transition",
-            )
-            await self._sources.stop()
-            stopped_for_transition = True
+        decision = self._universe_store.apply_due(midnight)
+        if decision is not None:
+            changed = tuple(sorted(set(previous.members) ^ set(decision.members)))
+            if was_running and changed:
+                boundary_gap = await self._gaps.open(
+                    GapReason.PLANNED_BOUNDARY,
+                    exchange_symbols=changed,
+                    detail="live subscriptions changing at a formal universe boundary",
+                )
+        active = decision or previous
+        # The writer barrier makes the sealed day inventory complete without
+        # interrupting any source when membership is unchanged.
         await self._ingest.rotate(universe_hash=active.universe_hash)
-        self._gaps.set_universe_hash(active.universe_hash)
-        await self._day_index.seal(previous_date, sealed_at=midnight)
-        if not stopped_for_transition or boundary_gap is None:
-            logger.info("sealed UTC day online date=%s", previous_date)
-            return
-        status = await asyncio.to_thread(self._spool.status)
-        if was_running and not status.hard_limited:
-            await self._sources.start(active.members)
-            await self._sources.wait_ready()
-        await self._gaps.close(
-            boundary_gap,
-            GapReason.PLANNED_BOUNDARY,
-            exchange_symbols=active.members,
-            detail="all sources ready after UTC universe transition",
+        if decision is not None:
+            self._gaps.set_universe_hash(active.universe_hash)
+            if was_running:
+                await self._sources.update_instruments(active.members)
+            if boundary_gap is not None:
+                await self._gaps.close(
+                    boundary_gap,
+                    GapReason.PLANNED_BOUNDARY,
+                    exchange_symbols=changed,
+                    detail="new subscriptions, L2 snapshots, and first OI samples are ready",
+                )
+        await self._day_index.seal(previous_date, sealed_at=datetime.now(UTC))
+        logger.info(
+            "sealed UTC day date=%s universe_changed=%s",
+            previous_date,
+            decision is not None,
         )
 
-    async def _control_loop(self) -> None:
-        while not self._stop.is_set():
-            async with self._operation_lock:
-                control = self._universe_store.apply_due(
-                    reasons=frozenset({ControlReason.NEW_LISTING_PROBE})
+    async def _on_discovery(self, snapshot: DiscoverySnapshot) -> None:
+        async with self._operation_lock:
+            decision = await asyncio.to_thread(
+                self._universe_store.observe_and_plan, snapshot
+            )
+            if decision is not None:
+                await self._emit_control_event(
+                    StreamType.UNIVERSE_DECISION,
+                    canonical_json_bytes(decision),
                 )
-                if control is not None:
-                    was_running = self._sources.running
-                    boundary_gap = await self._gaps.open(
-                        GapReason.PLANNED_BOUNDARY,
-                        exchange_symbols=self._universe_store.active.members,
-                        detail="new-listing probe universe boundary",
-                    )
-                    await self._sources.stop()
-                    await self._ingest.rotate(universe_hash=control.universe_hash)
-                    self._gaps.set_universe_hash(control.universe_hash)
-                    status = await asyncio.to_thread(self._spool.status)
-                    if was_running and not status.hard_limited:
-                        await self._sources.start(control.members)
-                        await self._sources.wait_ready()
-                    await self._gaps.close(
-                        boundary_gap,
-                        GapReason.PLANNED_BOUNDARY,
-                        exchange_symbols=control.members,
-                        detail="all sources ready after probe boundary",
-                    )
-            await _wait_event(self._stop, self._config.control_poll_seconds)
+                logger.info(
+                    "planned universe generation=%d effective_at=%s changed=%d",
+                    decision.generation,
+                    decision.effective_at,
+                    len(set(self._universe_store.active.members) ^ set(decision.members)),
+                )
+
+    async def _mark_formal_start(self) -> None:
+        if self._formal_start_path.exists():
+            return
+        active = self._universe_store.active
+        started_at = datetime.now(UTC)
+        payload = {
+            "event": "FORMAL_COLLECTION_STARTED",
+            "experiment_id": self._config.universe.experiment_id,
+            "generation": active.generation,
+            "started_at": started_at.isoformat(),
+            "universe_hash": active.universe_hash,
+        }
+        await self._emit_control_event(
+            StreamType.UNIVERSE_DECISION,
+            canonical_json_bytes(active),
+        )
+        await self._emit_control_event(
+            StreamType.FORMAL_COLLECTION_STARTED,
+            canonical_json_bytes(payload),
+        )
+        await self._ingest.rotate(universe_hash=active.universe_hash)
+        atomic_write_bytes(self._formal_start_path, canonical_json_bytes(payload))
+        logger.info(
+            "FORMAL_COLLECTION_STARTED experiment_id=%s generation=%d symbols=60",
+            self._config.universe.experiment_id,
+            active.generation,
+        )
+
+    async def _emit_control_event(self, stream_type: StreamType, payload: bytes) -> None:
+        event = self._control_identity.event(
+            stream_type=stream_type,
+            exchange_symbol=None,
+            payload=payload,
+            realtime_ns=time.time_ns(),
+            monotonic_ns=time.monotonic_ns(),
+        )
+        await self._ingest.put(event)
 
     async def _stats_loop(self) -> None:
         loop = asyncio.get_running_loop()

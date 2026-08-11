@@ -4,7 +4,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-RUN groupadd --gid 10001 collector \
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends openssh-client rsync \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 collector \
     && useradd --uid 10001 --gid collector --no-create-home --shell /usr/sbin/nologin collector
 
 WORKDIR /app

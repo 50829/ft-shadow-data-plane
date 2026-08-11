@@ -233,6 +233,9 @@ async def test_websocket_silence_fails_the_connection(monkeypatch: pytest.Monkey
         receive_timeout_seconds=0.01,
         ping_interval_seconds=20,
         ping_timeout_seconds=20,
+        max_queue=4,
+        max_message_bytes=2 * 1024**2,
+        updates=asyncio.Queue(),
         on_depth_gap=open_depth_gap,
         on_depth_reanchored=close_depth_gap,
     )

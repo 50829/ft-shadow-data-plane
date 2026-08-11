@@ -5,22 +5,58 @@ import os
 import subprocess
 from pathlib import Path
 
+from ft_shadow_data_plane.edge.config import load_edge_config
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 INSTALL_CAMPUS = PROJECT_ROOT / "deploy" / "campus-107" / "install.sh"
 SUBMIT_DAY = PROJECT_ROOT / "deploy" / "campus-107" / "submit-day.sh"
+
+
+def test_vultr_config_is_formal_sixty_and_memory_bounded() -> None:
+    config = load_edge_config(PROJECT_ROOT / "deploy/vultr/edge.yaml.example")
+    compose = (PROJECT_ROOT / "deploy/vultr/compose.yaml").read_text(encoding="ascii")
+    service = (
+        PROJECT_ROOT / "deploy/vultr/systemd/ft-shadow-data-plane.service"
+    ).read_text(encoding="ascii")
+
+    role_sizes = (
+        len(config.universe.core),
+        len(config.universe.boundary),
+        len(config.universe.probe),
+    )
+    assert role_sizes == (
+        50,
+        5,
+        5,
+    )
+    assert len(config.universe.members) == 60
+    assert config.public_connection_shards == 2
+    assert config.queue_max_bytes == 64 * 1024**2
+    assert config.websocket_max_queue == 4
+    assert config.writer_batch_bytes == 2 * 1024**2
+    assert "mem_limit: 768m" in compose
+    assert "cpus: 0.90" in compose
+    assert "pids_limit: 256" in compose
+    assert "--exit-code-from collector" in service
 
 
 def test_campus_installer_uses_hash_named_release(tmp_path: Path) -> None:
     release = tmp_path / "downloaded.sif"
     release.write_bytes(b"immutable release")
     install_root = tmp_path / "persistent"
+    fake_apptainer = tmp_path / "apptainer"
+    _write_fake_apptainer(fake_apptainer)
 
     result = subprocess.run(
         [str(INSTALL_CAMPUS), str(release)],
         check=False,
         capture_output=True,
         text=True,
-        env={**os.environ, "FT_CAMPUS_ROOT": str(install_root)},
+        env={
+            **os.environ,
+            "FT_APPTAINER": str(fake_apptainer),
+            "FT_CAMPUS_ROOT": str(install_root),
+        },
     )
 
     assert result.returncode == 0, result.stderr
@@ -30,6 +66,8 @@ def test_campus_installer_uses_hash_named_release(tmp_path: Path) -> None:
     assert versioned_release.read_bytes() == release.read_bytes()
     assert active_release.is_symlink()
     assert active_release.resolve() == versioned_release
+    assert (install_root / "ft-shadow-data-plane.sandbox").is_symlink()
+    assert os.access(install_root / "pull-once.sh", os.X_OK)
     assert (install_root / "central.yaml").is_file()
     assert (install_root / "deploy/campus-107/processing.env").is_file()
 
@@ -103,7 +141,8 @@ def _write_processing_env(tmp_path: Path, *, concurrency: int) -> Path:
     path.write_text(
         "\n".join(
             (
-                f"FT_DATA_SIF={tmp_path / 'release.sif'}",
+                f"FT_APPTAINER={tmp_path / 'apptainer'}",
+                f"FT_DATA_IMAGE={tmp_path / 'release.sandbox'}",
                 f"FT_RAW_ROOT={tmp_path / 'raw'}",
                 f"FT_DERIVED_ROOT={tmp_path / 'derived'}",
                 "FT_COLLECTOR=tokyo01",
@@ -127,6 +166,19 @@ case "$*" in
     *finalize.sbatch) echo '103;cluster' ;;
     *) exit 1 ;;
 esac
+""",
+        encoding="ascii",
+    )
+    path.chmod(0o755)
+
+
+def _write_fake_apptainer(path: Path) -> None:
+    path.write_text(
+        """#!/bin/sh
+set -eu
+test "$1" = build
+test "$2" = --sandbox
+mkdir -p "$3"
 """,
         encoding="ascii",
     )

@@ -3,18 +3,21 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import aiohttp
 from websockets.exceptions import ConnectionClosed
 
+from ft_shadow_data_plane.central.selector import DiscoverySnapshot
 from ft_shadow_data_plane.contracts.models import GapReason, StreamType
 from ft_shadow_data_plane.edge.binance import (
     BinanceRestClient,
     BinanceWebSocketConnection,
     SourceIdentity,
+    SubscriptionUpdate,
     market_subscriptions,
     public_subscriptions,
     shard_instruments,
@@ -59,6 +62,10 @@ class RouteRunner:
         rotation_offset_seconds: float = 0,
         d0_enabled: bool = False,
         on_ready: Callable[[str], None] | None = None,
+        subscriptions_for: Callable[[tuple[str, ...]], tuple[str, ...]] | None = None,
+        liveness_timeout_seconds: float | None = None,
+        websocket_max_queue: int = 4,
+        websocket_max_message_bytes: int = 2 * 1024**2,
     ) -> None:
         self._name = name
         self._url = url
@@ -80,6 +87,107 @@ class RouteRunner:
         self._service_stop = service_stop
         self._d0_enabled = d0_enabled
         self._on_ready = on_ready or (lambda _: None)
+        self._subscriptions_for = subscriptions_for
+        self._updates: asyncio.Queue[SubscriptionUpdate] = asyncio.Queue(maxsize=1)
+        self._update_lock = asyncio.Lock()
+        self._liveness_timeout_seconds = liveness_timeout_seconds
+        self._websocket_max_queue = websocket_max_queue
+        self._websocket_max_message_bytes = websocket_max_message_bytes
+        self._last_event = {symbol: time.monotonic() for symbol in instruments}
+
+    @property
+    def instruments(self) -> tuple[str, ...]:
+        return self._instruments
+
+    async def update_instruments(self, instruments: tuple[str, ...]) -> None:
+        if self._subscriptions_for is None:
+            raise RuntimeError(f"route {self._name} does not support live updates")
+        async with self._update_lock:
+            previous = set(self._instruments)
+            proposed = set(instruments)
+            added = tuple(sorted(proposed - previous))
+            old_subscriptions = set(self._subscriptions)
+            new_subscriptions = self._subscriptions_for(instruments)
+            completion = asyncio.get_running_loop().create_future()
+            await self._updates.put(
+                SubscriptionUpdate(
+                    add=tuple(sorted(set(new_subscriptions) - old_subscriptions)),
+                    remove=tuple(sorted(old_subscriptions - set(new_subscriptions))),
+                    snapshot_requests=self._snapshot_requests_for(added),
+                    completion=completion,
+                )
+            )
+            await asyncio.wait_for(completion, timeout=180)
+            self._subscriptions = new_subscriptions
+            self._instruments = instruments
+            now = time.monotonic()
+            self._last_event = {
+                symbol: self._last_event.get(symbol, now) for symbol in instruments
+            }
+
+    async def liveness_loop(self) -> None:
+        timeout = self._liveness_timeout_seconds
+        if timeout is None:
+            await self._service_stop.wait()
+            return
+        while not self._service_stop.is_set():
+            await self._wait_or_stop(max(10.0, timeout / 2))
+            if self._service_stop.is_set():
+                return
+            now = time.monotonic()
+            stale = tuple(
+                symbol
+                for symbol, observed_at in self._last_event.items()
+                if now - observed_at >= timeout
+            )
+            if not stale:
+                continue
+            logger.warning("targeted subscription refresh route=%s symbols=%s", self._name, stale)
+            gap_id = await self._gaps.open(
+                GapReason.CONNECTION_LOST,
+                exchange_symbols=stale,
+                stream_types=self._stream_types,
+                detail=f"{self._name}: no per-symbol public event for {timeout:g}s",
+            )
+            try:
+                await self._refresh_symbols(stale)
+                await self._gaps.close(
+                    gap_id,
+                    GapReason.CONNECTION_LOST,
+                    exchange_symbols=stale,
+                    stream_types=self._stream_types,
+                    detail="targeted subscriptions and L2 snapshots refreshed",
+                )
+            except (
+                QueueOverloaded,
+                aiohttp.ClientError,
+                OSError,
+                TimeoutError,
+            ):
+                logger.exception("targeted subscription refresh failed route=%s", self._name)
+
+    async def _refresh_symbols(self, symbols: tuple[str, ...]) -> None:
+        if self._subscriptions_for is None:
+            return
+        async with self._update_lock:
+            streams = self._subscriptions_for(symbols)
+            completion = asyncio.get_running_loop().create_future()
+            await self._updates.put(
+                SubscriptionUpdate(
+                    add=streams,
+                    remove=streams,
+                    snapshot_requests=self._snapshot_requests_for(symbols),
+                    completion=completion,
+                )
+            )
+            await asyncio.wait_for(completion, timeout=180)
+            refreshed_at = time.monotonic()
+            for symbol in symbols:
+                self._last_event[symbol] = refreshed_at
+
+    def _mark_event(self, _stream_type: StreamType, symbol: str | None) -> None:
+        if symbol in self._last_event:
+            self._last_event[symbol] = time.monotonic()
 
     async def run(self) -> None:
         current: ConnectionHandle | None = None
@@ -151,7 +259,15 @@ class RouteRunner:
                 continue
 
             try:
-                replacement = await self._start_ready_connection()
+                async with self._update_lock:
+                    replacement = await self._start_ready_connection()
+                    await self._wait_or_stop(self._overlap_seconds)
+                    if self._service_stop.is_set():
+                        await _stop_handle(replacement)
+                        await _stop_handle(current)
+                        return
+                    await _stop_handle(current)
+                    current = replacement
             except asyncio.CancelledError:
                 await _stop_handle(current)
                 return
@@ -165,13 +281,6 @@ class RouteRunner:
                 logger.warning("replacement connection failed route=%s error=%s", self._name, exc)
                 await self._wait_or_stop(30)
                 continue
-            await self._wait_or_stop(self._overlap_seconds)
-            if self._service_stop.is_set():
-                await _stop_handle(replacement)
-                await _stop_handle(current)
-                return
-            await _stop_handle(current)
-            current = replacement
 
     async def _start_ready_connection(self) -> ConnectionHandle:
         connection_id = f"{self._name}-{uuid4().hex}"
@@ -195,8 +304,12 @@ class RouteRunner:
             receive_timeout_seconds=self._receive_timeout_seconds,
             ping_interval_seconds=self._ping_interval_seconds,
             ping_timeout_seconds=self._ping_timeout_seconds,
+            max_queue=self._websocket_max_queue,
+            max_message_bytes=self._websocket_max_message_bytes,
+            updates=self._updates,
             on_depth_gap=self._open_depth_gap,
             on_depth_reanchored=self._close_depth_gap,
+            on_event=self._mark_event,
         )
         task = asyncio.create_task(connection.run(), name=connection_id)
         handle = ConnectionHandle(identity, ready, stop, task)
@@ -224,12 +337,17 @@ class RouteRunner:
         return handle
 
     def _snapshot_requests(self) -> tuple[tuple[str, StreamType], ...]:
+        return self._snapshot_requests_for(self._instruments)
+
+    def _snapshot_requests_for(
+        self, instruments: tuple[str, ...]
+    ) -> tuple[tuple[str, StreamType], ...]:
         if StreamType.DEPTH not in self._stream_types:
             return ()
-        requests = [(symbol, StreamType.DEPTH_SNAPSHOT) for symbol in self._instruments]
+        requests = [(symbol, StreamType.DEPTH_SNAPSHOT) for symbol in instruments]
         if self._d0_enabled:
             requests.extend(
-                (symbol, StreamType.RPI_DEPTH_SNAPSHOT) for symbol in self._instruments
+                (symbol, StreamType.RPI_DEPTH_SNAPSHOT) for symbol in instruments
             )
         return tuple(requests)
 
@@ -308,15 +426,21 @@ class RestPollers:
         rest: BinanceRestClient,
         stop: asyncio.Event,
         on_ready: Callable[[str], None],
+        on_discovery: Callable[[DiscoverySnapshot], Awaitable[None]],
     ) -> None:
         self._config = config
-        self._instruments = instruments
+        self._instruments = set(instruments)
         self._ingest = ingest
         self._queues = queues
         self._gaps = gaps
         self._rest = rest
         self._stop = stop
         self._on_ready = on_ready
+        self._on_discovery = on_discovery
+        self._oi_tasks: dict[str, asyncio.Task[None]] = {}
+        self._oi_first_pass: dict[str, asyncio.Future[None]] = {}
+        self._oi_lock = asyncio.Lock()
+        self._oi_ready_reported = False
         self._oi_identity = SourceIdentity(
             collector_id, boot_id, uuid4().hex, f"rest-open-interest-{uuid4().hex}"
         )
@@ -330,22 +454,67 @@ class RestPollers:
         )
 
     async def _open_interest_loop(self) -> None:
-        ready_symbols: set[str] = set()
-        interval = self._config.open_interest_interval_seconds
-        instrument_count = len(self._instruments)
-        await asyncio.gather(
-            *(
-                self._open_interest_symbol_loop(
-                    symbol,
-                    ready_symbols,
-                    initial_delay=index * interval / instrument_count,
+        await self._replace_open_interest_tasks(tuple(sorted(self._instruments)))
+        try:
+            while not self._stop.is_set():
+                for symbol, task in tuple(self._oi_tasks.items()):
+                    if task.done() and not task.cancelled():
+                        error = task.exception()
+                        if error is not None:
+                            raise RuntimeError(
+                                f"open-interest task failed for {symbol}"
+                            ) from error
+                await _wait_event(self._stop, 1)
+        finally:
+            tasks = list(self._oi_tasks.values())
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._oi_tasks.clear()
+
+    async def update_instruments(self, instruments: tuple[str, ...]) -> None:
+        await self._replace_open_interest_tasks(instruments)
+
+    async def _replace_open_interest_tasks(self, instruments: tuple[str, ...]) -> None:
+        async with self._oi_lock:
+            proposed = set(instruments)
+            removed = set(self._oi_tasks) - proposed
+            removed_tasks = [self._oi_tasks.pop(symbol) for symbol in removed]
+            for symbol in removed:
+                self._oi_first_pass.pop(symbol, None)
+            for task in removed_tasks:
+                task.cancel()
+            if removed_tasks:
+                await asyncio.gather(*removed_tasks, return_exceptions=True)
+
+            added = tuple(sorted(proposed - set(self._oi_tasks)))
+            interval = self._config.open_interest_interval_seconds
+            count = max(1, len(added))
+            for index, symbol in enumerate(added):
+                first_pass = asyncio.get_running_loop().create_future()
+                self._oi_first_pass[symbol] = first_pass
+                self._oi_tasks[symbol] = asyncio.create_task(
+                    self._open_interest_symbol_loop(
+                        symbol,
+                        first_pass,
+                        initial_delay=index * interval / count,
+                    ),
+                    name=f"open-interest-{symbol}",
                 )
-                for index, symbol in enumerate(self._instruments)
+            self._instruments = proposed
+        if added:
+            await asyncio.wait_for(
+                asyncio.gather(*(self._oi_first_pass[symbol] for symbol in added)),
+                timeout=max(120, self._config.open_interest_interval_seconds * 2),
             )
-        )
+        if not self._oi_ready_reported and set(self._oi_first_pass) == proposed:
+            first_passes = self._oi_first_pass.values()
+            if all(future.done() and future.exception() is None for future in first_passes):
+                self._oi_ready_reported = True
+                self._on_ready("open_interest")
 
     async def _open_interest_symbol_loop(
-        self, symbol: str, ready_symbols: set[str], *, initial_delay: float
+        self, symbol: str, first_pass: asyncio.Future[None], *, initial_delay: float
     ) -> None:
         gap: tuple[str, GapReason] | None = None
         streams = (StreamType.OPEN_INTEREST,)
@@ -359,9 +528,8 @@ class RestPollers:
             try:
                 await self._fetch_oi(symbol)
                 gap = await self._close_poll_gap(gap, symbols, streams)
-                ready_symbols.add(symbol)
-                if len(ready_symbols) == len(self._instruments):
-                    self._on_ready("open_interest")
+                if not first_pass.done():
+                    first_pass.set_result(None)
             except QueueOverloaded as exc:
                 gap = await self._open_poll_gap(
                     gap,
@@ -403,24 +571,25 @@ class RestPollers:
         streams = (StreamType.EXCHANGE_INFO, StreamType.MARKET_TICKERS)
         while not self._stop.is_set():
             try:
-                for path, stream_type in (
-                    ("/fapi/v1/exchangeInfo", StreamType.EXCHANGE_INFO),
-                    ("/fapi/v1/ticker/24hr", StreamType.MARKET_TICKERS),
-                ):
-                    payload, requested_at, observed_at, request_id = await self._rest.fetch(path)
-                    event = self._discovery_identity.event(
-                        stream_type=stream_type,
-                        exchange_symbol=None,
-                        payload=payload,
-                        realtime_ns=observed_at,
-                        monotonic_ns=time.monotonic_ns(),
-                        request_id=request_id,
-                        request_realtime_ns=requested_at,
-                    )
-                    await self._ingest.put(event)
+                exchange_info, _ = await self._fetch_discovery(
+                    "/fapi/v1/exchangeInfo", StreamType.EXCHANGE_INFO
+                )
+                market_tickers, _ = await self._fetch_discovery(
+                    "/fapi/v1/ticker/24hr", StreamType.MARKET_TICKERS
+                )
+                confirmation, observed_at = await self._fetch_discovery(
+                    "/fapi/v1/exchangeInfo", StreamType.EXCHANGE_INFO
+                )
+                snapshot = DiscoverySnapshot(
+                    observed_at=datetime.fromtimestamp(observed_at / 1_000_000_000, UTC),
+                    exchange_info=exchange_info,
+                    exchange_info_confirmation=confirmation,
+                    market_tickers=market_tickers,
+                )
+                await self._on_discovery(snapshot)
                 gap = await self._close_poll_gap(gap, (), streams)
                 self._on_ready("discovery")
-                await _wait_event(self._stop, self._config.exchange_info_interval_seconds)
+                await _wait_event(self._stop, self._seconds_until_discovery())
             except (aiohttp.ClientError, QueueOverloaded, TimeoutError) as exc:
                 reason = (
                     GapReason.INGEST_OVERLOAD
@@ -432,6 +601,36 @@ class RestPollers:
                     await self._queues.wait_until_resumable()
                 logger.warning("discovery poll failed error=%s", exc)
                 await _wait_event(self._stop, 30)
+
+    async def _fetch_discovery(
+        self, path: str, stream_type: StreamType
+    ) -> tuple[bytes, int]:
+        payload, requested_at, observed_at, request_id = await self._rest.fetch(path)
+        event = self._discovery_identity.event(
+            stream_type=stream_type,
+            exchange_symbol=None,
+            payload=payload,
+            realtime_ns=observed_at,
+            monotonic_ns=time.monotonic_ns(),
+            request_id=request_id,
+            request_realtime_ns=requested_at,
+        )
+        await self._ingest.put(event)
+        return payload, observed_at
+
+    def _seconds_until_discovery(self) -> float:
+        now = datetime.now(UTC)
+        scheduled = datetime.combine(
+            now.date(),
+            datetime.min.time().replace(
+                hour=self._config.universe.discovery_hour_utc,
+                minute=self._config.universe.discovery_minute_utc,
+            ),
+            UTC,
+        )
+        if scheduled <= now:
+            scheduled += timedelta(days=1)
+        return (scheduled - now).total_seconds()
 
     async def _clock_loop(self) -> None:
         gap: tuple[str, GapReason] | None = None
@@ -513,6 +712,7 @@ class SourceManager:
         ingest: IngestCoordinator,
         queues: ByteBoundedQueues,
         gaps: GapJournal,
+        on_discovery: Callable[[DiscoverySnapshot], Awaitable[None]],
     ) -> None:
         self._config = config
         self._collector_id = collector_id
@@ -520,9 +720,14 @@ class SourceManager:
         self._ingest = ingest
         self._queues = queues
         self._gaps = gaps
+        self._on_discovery = on_discovery
         self._stop: asyncio.Event | None = None
         self._task: asyncio.Task[None] | None = None
         self._ready: asyncio.Event | None = None
+        self._routes: dict[str, RouteRunner] = {}
+        self._pollers: RestPollers | None = None
+        self._instruments: tuple[str, ...] = ()
+        self._update_lock = asyncio.Lock()
 
     @property
     def running(self) -> bool:
@@ -541,6 +746,7 @@ class SourceManager:
             raise RuntimeError("sources already running")
         self._stop = asyncio.Event()
         self._ready = asyncio.Event()
+        self._instruments = instruments
         self._task = asyncio.create_task(
             self._run(instruments, self._stop, self._ready), name="binance-sources"
         )
@@ -571,6 +777,22 @@ class SourceManager:
         self._task = None
         self._stop = None
         self._ready = None
+        self._routes = {}
+        self._pollers = None
+
+    async def update_instruments(self, instruments: tuple[str, ...]) -> None:
+        if self._task is None or self._pollers is None:
+            raise RuntimeError("sources are not running")
+        async with self._update_lock:
+            shards = shard_instruments(instruments, self._config.public_connection_shards)
+            updates = [
+                self._routes[f"public-{index}"].update_instruments(shard)
+                for index, shard in enumerate(shards)
+            ]
+            updates.append(self._routes["market-0"].update_instruments(instruments))
+            updates.append(self._pollers.update_instruments(instruments))
+            await asyncio.gather(*updates)
+            self._instruments = instruments
 
     async def _run(
         self, instruments: tuple[str, ...], stop: asyncio.Event, ready: asyncio.Event
@@ -582,7 +804,7 @@ class SourceManager:
                 session,
                 snapshot_interval_seconds=self._config.snapshot_request_interval_seconds,
             )
-            routes = []
+            routes: list[Awaitable[None]] = []
             shards = shard_instruments(instruments, self._config.public_connection_shards)
             expected = {
                 *(f"public-{index}" for index in range(len(shards))),
@@ -607,44 +829,14 @@ class SourceManager:
                     snapshot_count * self._config.snapshot_request_interval_seconds
                     + self._config.connection_overlap_seconds
                 )
-                routes.append(
-                    RouteRunner(
-                        name=f"public-{index}",
-                        url=self._config.public_ws_url,
-                        subscriptions=public_subscriptions(
-                            shard, d0_enabled=self._config.d0_enabled
-                        ),
-                        instruments=shard,
-                        stream_types=tuple(public_stream_types),
-                        collector_id=self._collector_id,
-                        boot_id=self._boot_id,
-                        ingest=self._ingest,
-                        queues=self._queues,
-                        gaps=self._gaps,
-                        rest=rest,
-                        rotation_seconds=self._config.connection_rotation_seconds,
-                        rotation_offset_seconds=rotation_offset,
-                        overlap_seconds=self._config.connection_overlap_seconds,
-                        receive_timeout_seconds=self._config.websocket_receive_timeout_seconds,
-                        ping_interval_seconds=self._config.websocket_ping_interval_seconds,
-                        ping_timeout_seconds=self._config.websocket_ping_timeout_seconds,
-                        service_stop=stop,
-                        d0_enabled=self._config.d0_enabled,
-                        on_ready=mark_ready,
-                    ).run()
-                )
-            routes.append(
-                RouteRunner(
-                    name="market-0",
-                    url=self._config.market_ws_url,
-                    subscriptions=market_subscriptions(instruments),
-                    instruments=instruments,
-                    stream_types=(
-                        StreamType.AGG_TRADE,
-                        StreamType.MARK_PRICE,
-                        StreamType.FORCE_ORDER,
-                        StreamType.CONTRACT_INFO,
+                runner = RouteRunner(
+                    name=f"public-{index}",
+                    url=self._config.public_ws_url,
+                    subscriptions=public_subscriptions(
+                        shard, d0_enabled=self._config.d0_enabled
                     ),
+                    instruments=shard,
+                    stream_types=tuple(public_stream_types),
                     collector_id=self._collector_id,
                     boot_id=self._boot_id,
                     ingest=self._ingest,
@@ -652,14 +844,53 @@ class SourceManager:
                     gaps=self._gaps,
                     rest=rest,
                     rotation_seconds=self._config.connection_rotation_seconds,
+                    rotation_offset_seconds=rotation_offset,
                     overlap_seconds=self._config.connection_overlap_seconds,
                     receive_timeout_seconds=self._config.websocket_receive_timeout_seconds,
                     ping_interval_seconds=self._config.websocket_ping_interval_seconds,
                     ping_timeout_seconds=self._config.websocket_ping_timeout_seconds,
                     service_stop=stop,
+                    d0_enabled=self._config.d0_enabled,
                     on_ready=mark_ready,
-                ).run()
+                    subscriptions_for=lambda values: public_subscriptions(
+                        values, d0_enabled=self._config.d0_enabled
+                    ),
+                    liveness_timeout_seconds=self._config.symbol_liveness_seconds,
+                    websocket_max_queue=self._config.websocket_max_queue,
+                    websocket_max_message_bytes=self._config.websocket_max_message_bytes,
+                )
+                self._routes[f"public-{index}"] = runner
+                routes.extend((runner.run(), runner.liveness_loop()))
+            market_runner = RouteRunner(
+                name="market-0",
+                url=self._config.market_ws_url,
+                subscriptions=market_subscriptions(instruments),
+                instruments=instruments,
+                stream_types=(
+                    StreamType.AGG_TRADE,
+                    StreamType.MARK_PRICE,
+                    StreamType.FORCE_ORDER,
+                    StreamType.CONTRACT_INFO,
+                ),
+                collector_id=self._collector_id,
+                boot_id=self._boot_id,
+                ingest=self._ingest,
+                queues=self._queues,
+                gaps=self._gaps,
+                rest=rest,
+                rotation_seconds=self._config.connection_rotation_seconds,
+                overlap_seconds=self._config.connection_overlap_seconds,
+                receive_timeout_seconds=self._config.websocket_receive_timeout_seconds,
+                ping_interval_seconds=self._config.websocket_ping_interval_seconds,
+                ping_timeout_seconds=self._config.websocket_ping_timeout_seconds,
+                service_stop=stop,
+                on_ready=mark_ready,
+                subscriptions_for=market_subscriptions,
+                websocket_max_queue=self._config.websocket_max_queue,
+                websocket_max_message_bytes=self._config.websocket_max_message_bytes,
             )
+            self._routes["market-0"] = market_runner
+            routes.append(market_runner.run())
             pollers = RestPollers(
                 config=self._config,
                 instruments=instruments,
@@ -671,9 +902,14 @@ class SourceManager:
                 rest=rest,
                 stop=stop,
                 on_ready=mark_ready,
+                on_discovery=self._on_discovery,
             )
+            self._pollers = pollers
             routes.append(pollers.run())
-            await asyncio.gather(*routes)
+            try:
+                await asyncio.gather(*routes)
+            finally:
+                self._pollers = None
 
 
 async def _stop_handle(handle: ConnectionHandle) -> None:

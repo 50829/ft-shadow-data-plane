@@ -13,9 +13,11 @@ FORMAL_STREAMS_V1 = (
     "depth_snapshot",
     "exchange_info",
     "force_order",
+    "formal_collection_started",
     "mark_price",
     "market_tickers",
     "open_interest",
+    "universe_decision",
 )
 D0_STREAMS_V1 = ("rpi_depth", "rpi_depth_snapshot", "trade")
 

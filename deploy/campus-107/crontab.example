@@ -1,4 +1,7 @@
-MAILTO=researcher@example.edu
+SHELL=/bin/bash
+HOME=/home/scc/pb24000367
 PATH=/usr/local/bin:/usr/bin:/bin
+MAILTO=""
+R=/home/scc/pb24000367/Projects/bn/runtime
 
-* * * * * flock -n /persistent/ft-shadow-data-plane/pull.lock apptainer exec /persistent/ft-shadow-data-plane/ft-shadow-data-plane.sif ft-data-pull --config /persistent/ft-shadow-data-plane/central.yaml
+* * * * * /usr/bin/flock -n "$R/pull.lock" "$R/pull-once.sh" >> "$R/logs/pull.log" 2>&1

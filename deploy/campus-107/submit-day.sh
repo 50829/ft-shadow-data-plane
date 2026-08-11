@@ -31,7 +31,8 @@ fi
 set -a
 . "$processing_env"
 set +a
-: "${FT_DATA_SIF:?FT_DATA_SIF is required}"
+: "${FT_APPTAINER:?FT_APPTAINER is required}"
+: "${FT_DATA_IMAGE:?FT_DATA_IMAGE is required}"
 : "${FT_RAW_ROOT:?FT_RAW_ROOT is required}"
 : "${FT_DERIVED_ROOT:?FT_DERIVED_ROOT is required}"
 : "${FT_COLLECTOR:?FT_COLLECTOR is required}"

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import subprocess
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import BinaryIO
 
-from ft_shadow_data_plane.central.pull import CentralPuller
+import pytest
+
+from ft_shadow_data_plane.central.config import CentralConfig
+from ft_shadow_data_plane.central.pull import CentralPuller, RsyncTransport
 from ft_shadow_data_plane.contracts.models import (
     ChunkManifestV1,
     ContentType,
@@ -62,6 +66,39 @@ def test_hash_mismatch_never_acknowledges(tmp_path: Path) -> None:
     )
     assert puller.run() == (0, 1)
     assert f"control/acks/{manifest.chunk_id}.ack.json" not in remote.writes
+
+
+def test_rsync_transport_pins_ssh_identity_and_host_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+
+    def record(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("ft_shadow_data_plane.central.pull.subprocess.run", record)
+    config = CentralConfig(
+        host="167.179.115.243",
+        username="data-puller",
+        client_key=tmp_path / "key",
+        known_hosts=tmp_path / "known_hosts",
+        local_raw_root=tmp_path / "raw",
+        local_staging_root=tmp_path / "staging",
+    )
+    transport = RsyncTransport(config)
+    transport.pull_ready()
+    ack = tmp_path / "staging/control/acks/chunk-test.ack.json"
+    ack.parent.mkdir(parents=True)
+    ack.write_text("{}", encoding="ascii")
+    transport.push_acks()
+
+    assert len(calls) == 2
+    assert "StrictHostKeyChecking=yes" in calls[0][4]
+    assert f"UserKnownHostsFile={config.known_hosts}" in calls[0][4]
+    assert calls[0][-2] == "data-puller@167.179.115.243:ready/"
+    assert calls[1][-1] == "data-puller@167.179.115.243:control/acks/"
+    assert not ack.exists()
 
 
 def _remote_fixture(data: bytes) -> tuple[MemoryRemote, ChunkManifestV1]:

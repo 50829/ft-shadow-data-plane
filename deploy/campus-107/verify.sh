@@ -5,7 +5,7 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 processing_env=${FT_PROCESSING_ENV:-$script_dir/processing.env}
 install_root=${FT_CAMPUS_ROOT:-/persistent/ft-shadow-data-plane}
 
-for command_name in apptainer sbatch flock ssh; do
+for command_name in sbatch flock ssh; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
         echo "missing command: $command_name" >&2
         exit 1
@@ -22,14 +22,19 @@ done
 set -a
 . "$processing_env"
 set +a
-: "${FT_DATA_SIF:?FT_DATA_SIF is required}"
+: "${FT_APPTAINER:?FT_APPTAINER is required}"
+: "${FT_DATA_IMAGE:?FT_DATA_IMAGE is required}"
 : "${FT_RAW_ROOT:?FT_RAW_ROOT is required}"
 : "${FT_DERIVED_ROOT:?FT_DERIVED_ROOT is required}"
 : "${FT_COLLECTOR:?FT_COLLECTOR is required}"
 : "${FT_L2_CONCURRENCY:?FT_L2_CONCURRENCY is required}"
 
-if [ ! -r "$FT_DATA_SIF" ]; then
-    echo "missing or unreadable SIF: $FT_DATA_SIF" >&2
+if [ ! -x "$FT_APPTAINER" ]; then
+    echo "missing executable Apptainer: $FT_APPTAINER" >&2
+    exit 1
+fi
+if [ ! -d "$FT_DATA_IMAGE" ]; then
+    echo "missing Apptainer sandbox: $FT_DATA_IMAGE" >&2
     exit 1
 fi
 for path in "$FT_RAW_ROOT" "$FT_DERIVED_ROOT"; do
@@ -46,7 +51,8 @@ case "$FT_L2_CONCURRENCY" in
         ;;
 esac
 
-apptainer exec "$FT_DATA_SIF" ft-data-pull --help >/dev/null
-apptainer exec "$FT_DATA_SIF" ft-data-process --help >/dev/null
+"$FT_APPTAINER" exec --writable "$FT_DATA_IMAGE" ft-data-pull --help >/dev/null
+"$FT_APPTAINER" exec --writable "$FT_DATA_IMAGE" ft-data-process --help >/dev/null
+"$FT_APPTAINER" exec --writable "$FT_DATA_IMAGE" rsync --version >/dev/null
 sbatch --version
 echo "campus-107 deployment checks passed"

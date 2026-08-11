@@ -9,7 +9,7 @@ fi
 deploy_root=/opt/ft-shadow-data-plane/deploy/vultr
 config_root=/etc/ft-shadow-data-plane
 
-for command_name in docker systemctl sshd; do
+for command_name in docker rsync rrsync systemctl sshd; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
         echo "missing command: $command_name" >&2
         exit 1
@@ -49,15 +49,24 @@ case "$EDGE_IMAGE" in
         ;;
 esac
 
-for relative_path in ready writing control control/acks control/universe/inbox; do
+for relative_path in ready writing control control/acks control/universe; do
     if [ ! -d "$EDGE_DATA_ROOT/$relative_path" ]; then
         echo "missing data directory: $EDGE_DATA_ROOT/$relative_path" >&2
         exit 1
     fi
 done
+if [ ! -r /etc/ssh/authorized_keys/data-puller ]; then
+    echo "restricted rsync key is not configured" >&2
+    exit 1
+fi
 
 docker compose -f "$deploy_root/compose.yaml" config --quiet
 sshd -t
 systemctl is-active --quiet ft-shadow-data-plane.service
-docker compose -f "$deploy_root/compose.yaml" ps
+running_services=$(docker compose -f "$deploy_root/compose.yaml" ps --status running --services)
+if [ "$running_services" != collector ]; then
+    echo "collector container is not running" >&2
+    docker compose -f "$deploy_root/compose.yaml" ps >&2
+    exit 1
+fi
 echo "Vultr deployment checks passed"

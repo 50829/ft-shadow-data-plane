@@ -3,175 +3,103 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import orjson
 import pytest
-from pydantic import ValidationError
 
-from ft_shadow_data_plane.contracts.models import ControlReason, UniverseControlV1
-from ft_shadow_data_plane.contracts.serde import (
-    atomic_write_bytes,
-    canonical_json_bytes,
-    universe_hash,
-)
+from ft_shadow_data_plane.central.selector import DiscoverySnapshot
+from ft_shadow_data_plane.edge.config import UniversePolicyConfig
 from ft_shadow_data_plane.edge.universe import UniverseStore
 
 
-def test_daily_control_is_only_valid_at_utc_midnight() -> None:
-    members = ("BTCUSDT", "ETHUSDT")
-    created = datetime(2026, 8, 10, 12, tzinfo=UTC)
-    valid = UniverseControlV1(
-        generation=2,
-        created_at=created,
-        effective_at=datetime(2026, 8, 11, tzinfo=UTC),
-        reason=ControlReason.DAILY,
-        members=members,
-        universe_hash=universe_hash(members),
-    )
-    assert valid.effective_at.hour == 0
-    with pytest.raises(ValidationError, match="00:00 UTC"):
-        UniverseControlV1(
-            generation=2,
-            created_at=created,
-            effective_at=datetime(2026, 8, 11, 1, tzinfo=UTC),
-            reason=ControlReason.DAILY,
-            members=members,
-            universe_hash=universe_hash(members),
-        )
-    with pytest.raises(ValidationError, match="00:00 UTC"):
-        UniverseControlV1(
-            generation=2,
-            created_at=created,
-            effective_at=datetime(2026, 8, 11, microsecond=1, tzinfo=UTC),
-            reason=ControlReason.DAILY,
-            members=members,
-            universe_hash=universe_hash(members),
-        )
+def test_clean_store_starts_generation_one_with_all_sixty(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 11, 12, tzinfo=UTC)
+    store = UniverseStore(tmp_path, _policy())
+
+    active = store.initialize(now)
+
+    assert active.generation == 1
+    assert len(active.core) == 50
+    assert len(active.boundary) == 5
+    assert len(active.probe) == 5
+    assert len(active.members) == 60
+    assert (tmp_path / "control/universe/active.json").is_file()
 
 
-def test_canary_control_scales_through_fixed_nested_stages(tmp_path: Path) -> None:
-    created = datetime(2026, 8, 10, 12, tzinfo=UTC)
-    effective = datetime(2026, 8, 11, tzinfo=UTC)
-    store = UniverseStore(tmp_path, _members(20))
-    store.initialize()
+def test_confirmed_inactive_candidate_is_planned_for_next_midnight(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 11, 23, 50, tzinfo=UTC)
+    store = UniverseStore(tmp_path, _policy())
+    active = store.initialize(now - timedelta(days=3))
+    (tmp_path / "control/formal-start.json").write_text("{}", encoding="ascii")
+    snapshot = _snapshot(now, inactive=active.boundary[0])
 
-    stage_40 = _control(2, effective, _members(40), created=created)
-    _write_control(tmp_path, stage_40)
-    applied = store.apply_due(effective, reasons=frozenset({ControlReason.CANARY_SCALE}))
-    assert applied is not None
-    assert applied.members == _members(40)
+    decision = store.observe_and_plan(snapshot, now=now)
 
-    skipped_stage = _control(3, effective, _members(60), created=created)
-    _write_control(tmp_path, skipped_stage)
-    assert store.apply_due(
-        effective, reasons=frozenset({ControlReason.CANARY_SCALE})
-    ) is None
-    assert store.active.members == _members(40)
+    assert decision is not None
+    assert decision.effective_at == datetime(2026, 8, 12, tzinfo=UTC)
+    assert active.boundary[0] not in decision.members
+    assert store.has_due(decision.effective_at)
+    assert store.apply_due(decision.effective_at) == decision
 
 
-def test_canary_control_cannot_remove_members(tmp_path: Path) -> None:
-    created = datetime(2026, 8, 10, 12, tzinfo=UTC)
-    effective = datetime(2026, 8, 11, tzinfo=UTC)
-    initial = _members(20)
-    store = UniverseStore(tmp_path, initial)
-    store.initialize()
-    proposed = tuple(sorted((*initial[1:], *tuple(f"N{index:02}USDT" for index in range(21)))))
-    control = _control(2, effective, proposed, created=created)
-    _write_control(tmp_path, control)
+def test_paused_automation_still_rejects_inactive_formal_universe(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 11, 23, 50, tzinfo=UTC)
+    policy = _policy().model_copy(update={"automation_enabled": False})
+    store = UniverseStore(tmp_path, policy)
+    active = store.initialize(now - timedelta(days=3))
 
-    assert store.apply_due(
-        effective, reasons=frozenset({ControlReason.CANARY_SCALE})
-    ) is None
-    assert store.active.members == initial
+    with pytest.raises(ValueError, match="refusing formal start"):
+        store.observe_and_plan(_snapshot(now, inactive=active.core[0]), now=now)
 
 
-def test_has_due_does_not_apply_or_remove_control(tmp_path: Path) -> None:
-    effective = datetime(2026, 8, 11, tzinfo=UTC)
-    store = UniverseStore(tmp_path, _members(20))
-    initial = store.initialize()
-    control = _control(
-        2,
-        effective,
-        _members(40),
-        created=effective - timedelta(hours=12),
-    )
-    _write_control(tmp_path, control)
+def test_formal_bootstrap_binds_confirmed_source_hashes(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 11, 23, 50, tzinfo=UTC)
+    policy = _policy().model_copy(update={"automation_enabled": False})
+    store = UniverseStore(tmp_path, policy)
+    store.initialize(now - timedelta(days=3))
+    snapshot = _snapshot(now)
 
-    assert store.has_due(
-        effective, reasons=frozenset({ControlReason.CANARY_SCALE})
-    )
-    assert store.active == initial
-    assert (tmp_path / "control/universe/inbox/2.control.json").exists()
+    assert store.observe_and_plan(snapshot, now=now) is None
+    assert store.active.source_hashes == snapshot.source_hashes
+    persisted = (tmp_path / "control/universe/active.json").read_bytes()
+    assert b'"source_hashes"' in persisted
 
 
-def test_final_canary_enters_steady_state_before_accepting_probes(tmp_path: Path) -> None:
-    store = UniverseStore(tmp_path, _members(20))
-    store.initialize()
-    for generation, size, effective in (
-        (2, 40, datetime(2026, 8, 11, tzinfo=UTC)),
-        (3, 50, datetime(2026, 8, 12, tzinfo=UTC)),
-        (4, 60, datetime(2026, 8, 13, tzinfo=UTC)),
-    ):
-        control = _control(
-            generation,
-            effective,
-            _members(size),
-            created=effective - timedelta(hours=12),
-        )
-        _write_control(tmp_path, control)
-        assert store.apply_due(
-            effective, reasons=frozenset({ControlReason.CANARY_SCALE})
-        ) is not None
-
-    steady_at = datetime(2026, 8, 16, tzinfo=UTC)
-    steady = _control(
-        5,
-        steady_at,
-        _members(55),
-        created=steady_at - timedelta(hours=12),
-        reason=ControlReason.DAILY,
-    )
-    _write_control(tmp_path, steady)
-    assert store.apply_due(steady_at, reasons=frozenset({ControlReason.DAILY})) is not None
-
-    probe_members = tuple(sorted((*_members(55), "NEWUSDT")))
-    probe = _control(
-        6,
-        steady_at + timedelta(hours=1),
-        probe_members,
-        created=steady_at + timedelta(minutes=30),
-        reason=ControlReason.NEW_LISTING_PROBE,
-    )
-    _write_control(tmp_path, probe)
-    assert store.apply_due(
-        steady_at + timedelta(hours=1),
-        reasons=frozenset({ControlReason.NEW_LISTING_PROBE}),
-    ) is not None
-    assert store.active.members == probe_members
+def _members(start: int, stop: int) -> tuple[str, ...]:
+    return tuple(f"S{index:03}USDT" for index in range(start, stop))
 
 
-def _members(size: int) -> tuple[str, ...]:
-    return tuple(f"S{index:02}USDT" for index in range(size))
-
-
-def _control(
-    generation: int,
-    effective_at: datetime,
-    members: tuple[str, ...],
-    *,
-    created: datetime,
-    reason: ControlReason = ControlReason.CANARY_SCALE,
-) -> UniverseControlV1:
-    return UniverseControlV1(
-        generation=generation,
-        created_at=created,
-        effective_at=effective_at,
-        reason=reason,
-        members=members,
-        universe_hash=universe_hash(members),
+def _policy() -> UniversePolicyConfig:
+    return UniversePolicyConfig(
+        experiment_id="formal-test-60",
+        core=_members(0, 50),
+        boundary=_members(50, 55),
+        probe=_members(55, 60),
     )
 
 
-def _write_control(root: Path, control: UniverseControlV1) -> None:
-    atomic_write_bytes(
-        root / "control/universe/inbox" / f"{control.generation}.control.json",
-        canonical_json_bytes(control),
+def _snapshot(observed_at: datetime, *, inactive: str | None = None) -> DiscoverySnapshot:
+    first = []
+    confirmation = []
+    tickers = []
+    for index, symbol in enumerate(_members(0, 70)):
+        row = {
+            "symbol": symbol,
+            "contractType": "PERPETUAL",
+            "status": "SETTLING" if symbol == inactive else "TRADING",
+            "quoteAsset": "USDT",
+            "marginAsset": "USDT",
+            "onboardDate": int((observed_at - timedelta(days=100)).timestamp() * 1000),
+        }
+        first.append(row)
+        confirmation.append(dict(row))
+        tickers.append({"symbol": symbol, "quoteVolume": str(100_000 - index)})
+    return DiscoverySnapshot(
+        observed_at,
+        orjson.dumps({"symbols": first}),
+        orjson.dumps({"symbols": confirmation}),
+        orjson.dumps(tickers),
     )

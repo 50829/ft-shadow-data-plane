@@ -1,180 +1,323 @@
 from __future__ import annotations
 
+import gzip
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 
 import orjson
 
+from ft_shadow_data_plane.central.selector import (
+    DiscoverySnapshot,
+    RollingPolicy,
+    SelectionResult,
+    select_rolling_universe,
+)
 from ft_shadow_data_plane.contracts.models import (
-    CANARY_STAGE_SIZES,
-    ControlReason,
-    UniverseControlV1,
+    CandidateOverrideV1,
+    UniverseDecisionReason,
+    UniverseDecisionV1,
 )
 from ft_shadow_data_plane.contracts.serde import (
     atomic_write_bytes,
     canonical_json_bytes,
     universe_hash,
 )
+from ft_shadow_data_plane.edge.config import UniversePolicyConfig
 
 logger = logging.getLogger(__name__)
 
-NEW_LISTING_PROBE_SLOTS = 5
-
 
 class UniverseStore:
-    def __init__(self, data_root: Path, bootstrap_instruments: tuple[str, ...]) -> None:
-        self._active_path = data_root / "control" / "universe" / "active.json"
-        self._membership_path = (
-            data_root / "control" / "universe" / "membership-since.json"
-        )
-        self._inbox = data_root / "control" / "universe" / "inbox"
-        self._bootstrap = bootstrap_instruments
-        self._active: UniverseControlV1 | None = None
-        self._membership_since: dict[str, datetime] = {}
+    def __init__(self, data_root: Path, policy: UniversePolicyConfig) -> None:
+        self._root = data_root / "control" / "universe"
+        self._active_path = self._root / "active.json"
+        self._pending_path = self._root / "pending.json"
+        self._state_path = self._root / "membership-state.json"
+        self._observations = self._root / "observations"
+        self._decisions = self._root / "decisions"
+        self._evaluations = self._root / "evaluations"
+        self._overrides = self._root / "candidate-overrides"
+        self._policy = policy
+        self._active: UniverseDecisionV1 | None = None
+        self._member_since: dict[str, datetime] = {}
+        self._core_since: dict[str, datetime] = {}
 
     @property
-    def active(self) -> UniverseControlV1:
+    def active(self) -> UniverseDecisionV1:
         if self._active is None:
             raise RuntimeError("universe store has not been initialized")
         return self._active
 
-    def initialize(self) -> UniverseControlV1:
-        self._inbox.mkdir(parents=True, exist_ok=True)
+    def initialize(self, now: datetime | None = None) -> UniverseDecisionV1:
+        now = now or datetime.now(UTC)
+        for path in (
+            self._observations,
+            self._decisions,
+            self._evaluations,
+            self._overrides,
+        ):
+            path.mkdir(parents=True, exist_ok=True)
         if self._active_path.exists():
-            self._active = UniverseControlV1.model_validate_json(self._active_path.read_bytes())
-            self._load_or_initialize_membership()
+            self._active = UniverseDecisionV1.model_validate_json(self._active_path.read_bytes())
+            self._load_state()
             return self._active
-        now = datetime.now(UTC)
-        self._active = UniverseControlV1(
+        policy = self._policy
+        self._active = UniverseDecisionV1(
             generation=1,
             created_at=now,
             effective_at=now,
-            reason=ControlReason.BOOTSTRAP,
-            members=self._bootstrap,
-            universe_hash=universe_hash(self._bootstrap),
+            reason=UniverseDecisionReason.FORMAL_BOOTSTRAP,
+            core=policy.core,
+            boundary=policy.boundary,
+            probe=policy.probe,
+            universe_hash=universe_hash(policy.core, policy.boundary, policy.probe),
         )
-        atomic_write_bytes(self._active_path, canonical_json_bytes(self._active))
-        self._membership_since = {member: now for member in self._active.members}
-        self._write_membership()
+        self._member_since = {symbol: now for symbol in self._active.members}
+        self._core_since = {symbol: now for symbol in self._active.core}
+        self._write_active(self._active)
+        self._write_state()
         return self._active
 
-    def apply_due(
+    def observe_and_plan(
         self,
+        snapshot: DiscoverySnapshot,
+        *,
         now: datetime | None = None,
-        *,
-        reasons: frozenset[ControlReason] | None = None,
-    ) -> UniverseControlV1 | None:
-        now = now or datetime.now(UTC)
-        candidates = self._due_candidates(now, reasons)
-        if not candidates:
+    ) -> UniverseDecisionV1 | None:
+        now = now or snapshot.observed_at
+        self._write_observation(snapshot)
+        effective_at = _next_effective_at(now, self._policy.decision_cutoff_minute_utc)
+        snapshots = self._load_observations(self._policy.liquidity_window_days)
+        result = select_rolling_universe(
+            self.active,
+            snapshots,
+            effective_at=effective_at,
+            member_since=self._member_since,
+            core_since=self._core_since,
+            policy=_rolling_policy(self._policy),
+        )
+        formal_start = self._root.parent / "formal-start.json"
+        if not formal_start.exists():
+            if result.inactive:
+                raise ValueError(
+                    "refusing formal start with confirmed inactive instruments: "
+                    + ",".join(result.inactive)
+                )
+            if self.active.reason is UniverseDecisionReason.FORMAL_BOOTSTRAP:
+                self._active = self.active.model_copy(
+                    update={"source_hashes": snapshot.source_hashes}
+                )
+                self._write_active(self.active)
+        if not self._policy.automation_enabled:
+            logger.info("automatic universe decisions are paused by configuration")
             return None
-        selected_path, selected = max(candidates, key=lambda item: item[1].generation)
-        try:
-            self._validate_transition(selected)
-        except ValueError:
-            logger.exception("rejecting unsafe universe transition path=%s", selected_path)
-            selected_path.replace(selected_path.with_suffix(".rejected.json"))
-            return None
-        effective = selected.effective_at
-        self._membership_since = {
-            member: self._membership_since.get(member, effective) for member in selected.members
+        reason = _decision_reason(self.active, result, effective_at)
+        evaluation = {
+            "active_generation": self.active.generation,
+            "boundary": list(result.boundary),
+            "core": list(result.core),
+            "effective_at": effective_at.isoformat(),
+            "evaluated_at": now.isoformat(),
+            "inactive": list(result.inactive),
+            "probe": list(result.probe),
+            "source_hashes": list(result.source_hashes),
         }
-        self._write_membership()
-        atomic_write_bytes(self._active_path, canonical_json_bytes(selected))
-        self._active = selected
-        for path in self._inbox.glob("*.control.json"):
+        evaluation_name = f"{now.strftime('%Y%m%dT%H%M%S.%fZ')}.evaluation.json"
+        atomic_write_bytes(self._evaluations / evaluation_name, canonical_json_bytes(evaluation))
+        if (
+            result.core == self.active.core
+            and result.boundary == self.active.boundary
+            and result.probe == self.active.probe
+        ):
+            self._pending_path.unlink(missing_ok=True)
+            return None
+        decision = UniverseDecisionV1(
+            generation=self.active.generation + 1,
+            created_at=now,
+            effective_at=effective_at,
+            reason=reason,
+            core=result.core,
+            boundary=result.boundary,
+            probe=result.probe,
+            source_hashes=result.source_hashes,
+            universe_hash=universe_hash(result.core, result.boundary, result.probe),
+        )
+        atomic_write_bytes(self._pending_path, canonical_json_bytes(decision))
+        return decision
+
+    def has_due(self, now: datetime) -> bool:
+        return self._select_due(now) is not None
+
+    def apply_due(self, now: datetime | None = None) -> UniverseDecisionV1 | None:
+        now = now or datetime.now(UTC)
+        selected = self._select_due(now)
+        if selected is None:
+            return None
+        decision, source_path = selected
+        previous = self.active
+        self._active = decision
+        for symbol in decision.members:
+            self._member_since.setdefault(symbol, decision.effective_at)
+        self._member_since = {
+            symbol: joined
+            for symbol, joined in self._member_since.items()
+            if symbol in decision.members
+        }
+        for symbol in decision.core:
+            if symbol not in previous.core:
+                self._core_since[symbol] = decision.effective_at
+            else:
+                self._core_since.setdefault(symbol, decision.effective_at)
+        self._core_since = {
+            symbol: joined for symbol, joined in self._core_since.items() if symbol in decision.core
+        }
+        self._write_active(decision)
+        self._write_state()
+        source_path.unlink(missing_ok=True)
+        self._pending_path.unlink(missing_ok=True)
+        return decision
+
+    def _select_due(self, now: datetime) -> tuple[UniverseDecisionV1, Path] | None:
+        candidates: list[tuple[UniverseDecisionV1, Path]] = []
+        if self._pending_path.exists():
+            pending = UniverseDecisionV1.model_validate_json(self._pending_path.read_bytes())
+            if pending.generation > self.active.generation and pending.effective_at <= now:
+                candidates.append((pending, self._pending_path))
+        for path in self._overrides.glob("*.override.json"):
             try:
-                control = UniverseControlV1.model_validate_json(path.read_bytes())
+                override = CandidateOverrideV1.model_validate_json(path.read_bytes())
+                decision = self._decision_from_override(override)
             except ValueError:
+                logger.exception("rejecting invalid candidate override path=%s", path)
+                path.replace(path.with_suffix(".rejected.json"))
                 continue
-            if control.generation <= selected.generation:
-                path.unlink(missing_ok=True)
-        return selected
+            if decision.generation > self.active.generation and decision.effective_at <= now:
+                candidates.append((decision, path))
+        return max(candidates, key=lambda item: item[0].generation) if candidates else None
 
-    def has_due(
-        self,
-        now: datetime,
-        *,
-        reasons: frozenset[ControlReason] | None = None,
-    ) -> bool:
-        return bool(self._due_candidates(now, reasons))
+    def _decision_from_override(self, override: CandidateOverrideV1) -> UniverseDecisionV1:
+        proposed = set((*override.boundary, *override.probe))
+        if proposed & set(self.active.core):
+            raise ValueError("candidate override cannot include active core members")
+        current = set((*self.active.boundary, *self.active.probe))
+        if len(proposed - current) > self._policy.candidate_daily_replacements:
+            raise ValueError("candidate override exceeds daily replacement limit")
+        minimum_joined_at = override.effective_at - timedelta(
+            hours=self._policy.candidate_minimum_dwell_hours
+        )
+        too_young = [
+            symbol
+            for symbol in current - proposed
+            if self._member_since.get(symbol, override.effective_at) > minimum_joined_at
+        ]
+        if too_young:
+            raise ValueError(f"candidate override violates dwell: {too_young}")
+        return UniverseDecisionV1(
+            generation=override.generation,
+            created_at=override.created_at,
+            effective_at=override.effective_at,
+            reason=UniverseDecisionReason.MANUAL_CANDIDATE_OVERRIDE,
+            core=self.active.core,
+            boundary=override.boundary,
+            probe=override.probe,
+            universe_hash=universe_hash(self.active.core, override.boundary, override.probe),
+        )
 
-    def _due_candidates(
-        self,
-        now: datetime,
-        reasons: frozenset[ControlReason] | None,
-    ) -> list[tuple[Path, UniverseControlV1]]:
-        candidates: list[tuple[Path, UniverseControlV1]] = []
-        for path in sorted(self._inbox.glob("*.control.json")):
-            try:
-                control = UniverseControlV1.model_validate_json(path.read_bytes())
-            except ValueError:
-                logger.exception("ignoring invalid universe control path=%s", path)
-                continue
-            if (
-                control.generation > self.active.generation
-                and control.effective_at <= now
-                and (reasons is None or control.reason in reasons)
-            ):
-                candidates.append((path, control))
-        return candidates
-
-    def _validate_transition(self, selected: UniverseControlV1) -> None:
-        current = set(self.active.members)
-        proposed = set(selected.members)
-        removed = current - proposed
-        added = proposed - current
-        if selected.reason is ControlReason.DAILY:
-            if len(removed) > 5 or len(added) > 5:
-                raise ValueError("daily control may replace at most five members")
-            minimum_joined_at = selected.effective_at - timedelta(hours=48)
-            too_young = [
-                member
-                for member in removed
-                if self._membership_since.get(member, selected.effective_at) > minimum_joined_at
-            ]
-            if too_young:
-                raise ValueError(f"daily control violates 48h dwell: {too_young}")
-        elif selected.reason is ControlReason.CANARY_SCALE:
-            if self.active.reason not in {ControlReason.BOOTSTRAP, ControlReason.CANARY_SCALE}:
-                raise ValueError("canary scale is only valid before daily operation")
-            if not current < proposed:
-                raise ValueError("canary scale must only add members")
-            next_sizes = [size for size in CANARY_STAGE_SIZES if size > len(current)]
-            if not next_sizes or len(proposed) != next_sizes[0]:
-                expected = next_sizes[0] if next_sizes else "none"
-                raise ValueError(f"next canary size must be {expected}")
-        elif selected.reason is ControlReason.NEW_LISTING_PROBE:
-            if self.active.reason in {ControlReason.BOOTSTRAP, ControlReason.CANARY_SCALE}:
-                raise ValueError("new-listing probes are disabled until daily operation")
-            if removed:
-                raise ValueError("new-listing probe control cannot remove existing members")
-            if len(added) > NEW_LISTING_PROBE_SLOTS:
-                raise ValueError("new-listing probe control may add at most five members")
-
-    def _load_or_initialize_membership(self) -> None:
-        if self._membership_path.exists():
-            raw = orjson.loads(self._membership_path.read_bytes())
-            if not isinstance(raw, dict):
-                raise ValueError("membership-since state must be an object")
-            self._membership_since = {
-                member: datetime.fromisoformat(str(raw[member]))
-                for member in self.active.members
-                if member in raw
-            }
-        effective = self.active.effective_at
-        for member in self.active.members:
-            self._membership_since.setdefault(member, effective)
-        self._write_membership()
-
-    def _write_membership(self) -> None:
+    def _write_observation(self, snapshot: DiscoverySnapshot) -> None:
+        root = self._observations / snapshot.observed_at.date().isoformat()
+        atomic_write_bytes(root / "exchange-info.json.gz", gzip.compress(snapshot.exchange_info))
         atomic_write_bytes(
-            self._membership_path,
+            root / "exchange-info-confirmation.json.gz",
+            gzip.compress(snapshot.exchange_info_confirmation),
+        )
+        atomic_write_bytes(root / "market-tickers.json.gz", gzip.compress(snapshot.market_tickers))
+        atomic_write_bytes(
+            root / "observation.json",
             canonical_json_bytes(
                 {
-                    member: joined_at.isoformat()
-                    for member, joined_at in sorted(self._membership_since.items())
+                    "observed_at": snapshot.observed_at.isoformat(),
+                    "source_hashes": list(snapshot.source_hashes),
                 }
             ),
         )
+
+    def _load_observations(self, limit: int) -> tuple[DiscoverySnapshot, ...]:
+        loaded: list[DiscoverySnapshot] = []
+        for root in sorted(self._observations.iterdir())[-limit:]:
+            metadata = orjson.loads((root / "observation.json").read_bytes())
+            loaded.append(
+                DiscoverySnapshot(
+                    observed_at=datetime.fromisoformat(str(metadata["observed_at"])),
+                    exchange_info=gzip.decompress((root / "exchange-info.json.gz").read_bytes()),
+                    exchange_info_confirmation=gzip.decompress(
+                        (root / "exchange-info-confirmation.json.gz").read_bytes()
+                    ),
+                    market_tickers=gzip.decompress((root / "market-tickers.json.gz").read_bytes()),
+                )
+            )
+        return tuple(loaded)
+
+    def _load_state(self) -> None:
+        raw = orjson.loads(self._state_path.read_bytes())
+        self._member_since = {
+            symbol: datetime.fromisoformat(value) for symbol, value in raw["member_since"].items()
+        }
+        self._core_since = {
+            symbol: datetime.fromisoformat(value) for symbol, value in raw["core_since"].items()
+        }
+
+    def _write_active(self, decision: UniverseDecisionV1) -> None:
+        atomic_write_bytes(self._active_path, canonical_json_bytes(decision))
+        atomic_write_bytes(
+            self._decisions / f"{decision.generation}.decision.json",
+            canonical_json_bytes(decision),
+        )
+
+    def _write_state(self) -> None:
+        atomic_write_bytes(
+            self._state_path,
+            canonical_json_bytes(
+                {
+                    "core_since": {
+                        symbol: joined.isoformat()
+                        for symbol, joined in sorted(self._core_since.items())
+                    },
+                    "member_since": {
+                        symbol: joined.isoformat()
+                        for symbol, joined in sorted(self._member_since.items())
+                    },
+                }
+            ),
+        )
+
+
+def _next_effective_at(now: datetime, cutoff_minute: int) -> datetime:
+    effective = datetime.combine(now.date() + timedelta(days=1), time.min, UTC)
+    if now.hour == 23 and now.minute > cutoff_minute:
+        effective += timedelta(days=1)
+    return effective
+
+
+def _rolling_policy(value: UniversePolicyConfig) -> RollingPolicy:
+    return RollingPolicy(
+        liquidity_window_days=value.liquidity_window_days,
+        candidate_minimum_dwell_hours=value.candidate_minimum_dwell_hours,
+        core_minimum_dwell_days=value.core_minimum_dwell_days,
+        candidate_daily_replacements=value.candidate_daily_replacements,
+        core_weekly_replacements=value.core_weekly_replacements,
+        core_minimum_age_days=value.core_minimum_age_days,
+        core_entry_rank=value.core_entry_rank,
+        core_retain_rank=value.core_retain_rank,
+        boundary_retain_rank=value.boundary_retain_rank,
+    )
+
+
+def _decision_reason(
+    active: UniverseDecisionV1, result: SelectionResult, effective_at: datetime
+) -> UniverseDecisionReason:
+    if result.inactive:
+        return UniverseDecisionReason.INACTIVE_REPLACEMENT
+    if result.core != active.core and effective_at.weekday() == 0:
+        return UniverseDecisionReason.WEEKLY_CORE
+    return UniverseDecisionReason.DAILY_CANDIDATE

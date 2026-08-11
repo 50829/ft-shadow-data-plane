@@ -3,13 +3,12 @@ from __future__ import annotations
 import logging
 import os
 import posixpath
-import stat
-from contextlib import AbstractContextManager
+import shlex
+import shutil
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO, Protocol, Self
-
-import paramiko
+from typing import BinaryIO, Protocol
 
 from ft_shadow_data_plane.central.config import CentralConfig
 from ft_shadow_data_plane.contracts.models import AckV1, ChunkManifestV1, DayManifestV1
@@ -33,76 +32,118 @@ class RemoteStore(Protocol):
     def write_atomic(self, path: str, content: bytes) -> None: ...
 
 
-class ParamikoRemoteStore(AbstractContextManager["ParamikoRemoteStore"]):
-    def __init__(self, config: CentralConfig) -> None:
-        self._config = config
-        self._client: paramiko.SSHClient | None = None
-        self._sftp: paramiko.SFTPClient | None = None
+class FilesystemRemoteStore:
+    """Expose an rsync mirror through the same durable ingest contract used by tests."""
 
-    def __enter__(self) -> Self:
-        client = paramiko.SSHClient()
-        client.load_host_keys(str(self._config.known_hosts))
-        client.set_missing_host_key_policy(paramiko.RejectPolicy())
-        client.connect(
-            hostname=self._config.host,
-            port=self._config.port,
-            username=self._config.username,
-            key_filename=str(self._config.client_key),
-            timeout=self._config.connect_timeout_seconds,
-            allow_agent=False,
-            look_for_keys=False,
-        )
-        self._client = client
-        self._sftp = client.open_sftp()
-        return self
-
-    def __exit__(self, *args: object) -> None:
-        if self._sftp is not None:
-            self._sftp.close()
-        if self._client is not None:
-            self._client.close()
-
-    @property
-    def sftp(self) -> paramiko.SFTPClient:
-        if self._sftp is None:
-            raise RuntimeError("SFTP connection is not open")
-        return self._sftp
+    def __init__(self, root: Path) -> None:
+        self._root = root
 
     def list_files(self, root: str) -> tuple[str, ...]:
-        files: list[str] = []
-        pending = [root]
-        while pending:
-            directory = pending.pop()
-            try:
-                entries = self.sftp.listdir_attr(directory)
-            except FileNotFoundError:
-                continue
-            for entry in entries:
-                path = posixpath.join(directory, entry.filename)
-                if stat.S_ISDIR(entry.st_mode):
-                    pending.append(path)
-                elif stat.S_ISREG(entry.st_mode):
-                    files.append(path)
-        return tuple(sorted(files))
+        directory = self._path(root)
+        if not directory.exists():
+            return ()
+        files = (
+            path.relative_to(self._root).as_posix()
+            for path in directory.rglob("*")
+            if path.is_file()
+        )
+        return tuple(
+            sorted(files)
+        )
 
     def read_bytes(self, path: str) -> bytes:
-        with self.sftp.open(path, "rb") as source:
-            value = source.read()
-        return value if isinstance(value, bytes) else value.encode()
+        return self._path(path).read_bytes()
 
     def download(self, remote_path: str, local_file: BinaryIO) -> None:
-        self.sftp.getfo(remote_path, local_file)
+        with self._path(remote_path).open("rb") as source:
+            shutil.copyfileobj(source, local_file, length=1024 * 1024)
 
     def write_atomic(self, path: str, content: bytes) -> None:
-        parent = posixpath.dirname(path)
-        temporary = posixpath.join(parent, f".{posixpath.basename(path)}.partial")
-        with self.sftp.open(temporary, "wb") as destination:
-            destination.write(content)
-            destination.flush()
-        try:
-            self.sftp.posix_rename(temporary, path)
-        except OSError:
-            self.sftp.rename(temporary, path)
+        atomic_write_bytes(self._path(path), content)
+
+    def _path(self, value: str) -> Path:
+        relative = safe_remote_root(value)
+        path = self._root / relative
+        if not path.resolve(strict=False).is_relative_to(self._root.resolve()):
+            raise ValueError("rsync mirror path escapes its root")
+        return path
+
+
+class RsyncTransport:
+    def __init__(self, config: CentralConfig) -> None:
+        self._config = config
+        self._ready_root = safe_remote_root(config.remote_ready_root)
+        self._ack_root = safe_remote_root(config.remote_ack_root)
+        self._mirror = config.local_staging_root
+
+    @property
+    def store(self) -> FilesystemRemoteStore:
+        return FilesystemRemoteStore(self._mirror)
+
+    def pull_ready(self) -> None:
+        destination = self._mirror / self._ready_root
+        destination.mkdir(parents=True, exist_ok=True)
+        self._run(
+            "--archive",
+            "--delete-delay",
+            "--delay-updates",
+            "--no-links",
+            "--partial",
+            self._remote(f"{self._ready_root}/"),
+            f"{destination}/",
+        )
+
+    def push_acks(self) -> None:
+        source = self._mirror / self._ack_root
+        source.mkdir(parents=True, exist_ok=True)
+        if not any(source.glob("*.ack.json")):
+            return
+        self._run(
+            "--archive",
+            "--delay-updates",
+            f"{source}/",
+            self._remote(f"{self._ack_root}/"),
+        )
+        for path in source.glob("*.ack.json"):
+            path.unlink()
+        fsync_directory(source)
+
+    def _run(self, *arguments: str) -> None:
+        command = [
+            str(self._config.rsync_binary),
+            "--timeout",
+            str(self._config.io_timeout_seconds),
+            "--rsh",
+            shlex.join(self._ssh_command()),
+            *arguments,
+        ]
+        result = subprocess.run(command, check=False, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise OSError(
+                f"rsync failed exit={result.returncode}: {result.stderr.strip()}"
+            )
+
+    def _ssh_command(self) -> list[str]:
+        return [
+            str(self._config.ssh_binary),
+            "-p",
+            str(self._config.port),
+            "-i",
+            str(self._config.client_key),
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            f"UserKnownHostsFile={self._config.known_hosts}",
+            "-o",
+            f"ConnectTimeout={self._config.connect_timeout_seconds}",
+        ]
+
+    def _remote(self, path: str) -> str:
+        return f"{self._config.username}@{self._config.host}:{path}"
 
 
 class CentralPuller:
@@ -211,5 +252,5 @@ class CentralPuller:
 def safe_remote_root(value: str) -> str:
     path = PurePosixPath(value)
     if path.is_absolute() or ".." in path.parts:
-        raise ValueError("remote paths must be relative to the SFTP account root")
+        raise ValueError("remote paths must be relative to the restricted rsync root")
     return value.rstrip("/")

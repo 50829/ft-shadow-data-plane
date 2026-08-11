@@ -12,7 +12,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{1,30}$")
 HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{8,160}$")
-CANARY_STAGE_SIZES = (20, 40, 50, 60)
 
 
 class StreamType(StrEnum):
@@ -29,6 +28,8 @@ class StreamType(StrEnum):
     OPEN_INTEREST = "open_interest"
     EXCHANGE_INFO = "exchange_info"
     MARKET_TICKERS = "market_tickers"
+    UNIVERSE_DECISION = "universe_decision"
+    FORMAL_COLLECTION_STARTED = "formal_collection_started"
     CLOCK_SAMPLE = "clock_sample"
     WS_CONTROL = "ws_control"
     UNKNOWN = "unknown"
@@ -60,11 +61,12 @@ class GapState(StrEnum):
     CLOSED = "CLOSED"
 
 
-class ControlReason(StrEnum):
-    DAILY = "daily"
-    CANARY_SCALE = "canary_scale"
-    NEW_LISTING_PROBE = "new_listing_probe"
-    BOOTSTRAP = "bootstrap"
+class UniverseDecisionReason(StrEnum):
+    FORMAL_BOOTSTRAP = "formal_bootstrap"
+    DAILY_CANDIDATE = "daily_candidate"
+    WEEKLY_CORE = "weekly_core"
+    INACTIVE_REPLACEMENT = "inactive_replacement"
+    MANUAL_CANDIDATE_OVERRIDE = "manual_candidate_override"
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,13 +275,16 @@ class GapEventV1(FrozenModel):
         return values
 
 
-class UniverseControlV1(FrozenModel):
+class UniverseDecisionV1(FrozenModel):
     schema_version: Literal[1] = 1
     generation: int = Field(ge=1)
     created_at: datetime
     effective_at: datetime
-    reason: ControlReason
-    members: tuple[str, ...] = Field(min_length=1, max_length=60)
+    reason: UniverseDecisionReason
+    core: tuple[str, ...] = Field(min_length=50, max_length=50)
+    boundary: tuple[str, ...] = Field(min_length=5, max_length=5)
+    probe: tuple[str, ...] = Field(min_length=5, max_length=5)
+    source_hashes: tuple[str, ...] = ()
     universe_hash: str
 
     @field_validator("created_at", "effective_at")
@@ -287,35 +292,81 @@ class UniverseControlV1(FrozenModel):
     def require_utc(cls, value: datetime) -> datetime:
         return ChunkManifestV1.require_utc(value)
 
-    @field_validator("members")
+    @field_validator("core", "boundary", "probe")
     @classmethod
     def validate_members(cls, values: tuple[str, ...]) -> tuple[str, ...]:
         normalized = tuple(value.upper() for value in values)
         if any(not SYMBOL_PATTERN.fullmatch(value) for value in normalized):
-            raise ValueError("control contains an invalid exchange symbol")
+            raise ValueError("universe contains an invalid exchange symbol")
         if len(normalized) != len(set(normalized)):
-            raise ValueError("control contains duplicate members")
+            raise ValueError("universe role contains duplicate members")
         if normalized != tuple(sorted(normalized)):
-            raise ValueError("control members must be sorted")
+            raise ValueError("universe role members must be sorted")
+        return normalized
+
+    @field_validator("source_hashes")
+    @classmethod
+    def validate_source_hashes(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not HASH_PATTERN.fullmatch(value) for value in values):
+            raise ValueError("source hashes must be lowercase SHA-256")
+        return values
+
+    @property
+    def members(self) -> tuple[str, ...]:
+        return tuple(sorted((*self.core, *self.boundary, *self.probe)))
+
+    @model_validator(mode="after")
+    def validate_schedule_and_hash(self) -> UniverseDecisionV1:
+        if self.effective_at < self.created_at:
+            raise ValueError("decision cannot be effective before creation")
+        all_members = (*self.core, *self.boundary, *self.probe)
+        if len(set(all_members)) != 60:
+            raise ValueError("universe roles must contain 60 distinct members")
+        if self.reason is not UniverseDecisionReason.FORMAL_BOOTSTRAP and any(
+            (self.effective_at.hour, self.effective_at.minute,
+             self.effective_at.second, self.effective_at.microsecond)
+        ):
+            raise ValueError("universe changes must become effective at 00:00 UTC")
+        from ft_shadow_data_plane.contracts.serde import universe_hash
+
+        if self.universe_hash != universe_hash(self.core, self.boundary, self.probe):
+            raise ValueError("universe_hash does not match role membership")
+        return self
+
+
+class CandidateOverrideV1(FrozenModel):
+    schema_version: Literal[1] = 1
+    generation: int = Field(ge=2)
+    created_at: datetime
+    effective_at: datetime
+    boundary: tuple[str, ...] = Field(min_length=5, max_length=5)
+    probe: tuple[str, ...] = Field(min_length=5, max_length=5)
+    reason: Literal["manual_candidate_override"] = "manual_candidate_override"
+
+    @field_validator("created_at", "effective_at")
+    @classmethod
+    def require_utc(cls, value: datetime) -> datetime:
+        return ChunkManifestV1.require_utc(value)
+
+    @field_validator("boundary", "probe")
+    @classmethod
+    def validate_members(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(sorted(value.upper() for value in values))
+        if any(not SYMBOL_PATTERN.fullmatch(value) for value in normalized):
+            raise ValueError("override contains an invalid exchange symbol")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("override role contains duplicate members")
         return normalized
 
     @model_validator(mode="after")
-    def validate_schedule_and_hash(self) -> UniverseControlV1:
+    def validate_override(self) -> CandidateOverrideV1:
         if self.effective_at < self.created_at:
-            raise ValueError("control cannot be effective before creation")
-        if self.reason in {ControlReason.DAILY, ControlReason.CANARY_SCALE} and any(
-            (
-                self.effective_at.hour,
-                self.effective_at.minute,
-                self.effective_at.second,
-                self.effective_at.microsecond,
-            )
-        ):
-            raise ValueError("daily and canary controls must become effective at 00:00 UTC")
-        from ft_shadow_data_plane.contracts.serde import universe_hash
-
-        if self.universe_hash != universe_hash(self.members):
-            raise ValueError("universe_hash does not match members")
+            raise ValueError("override cannot be effective before creation")
+        if any((self.effective_at.hour, self.effective_at.minute,
+                self.effective_at.second, self.effective_at.microsecond)):
+            raise ValueError("candidate override must become effective at 00:00 UTC")
+        if set(self.boundary) & set(self.probe):
+            raise ValueError("candidate override roles must be disjoint")
         return self
 
 

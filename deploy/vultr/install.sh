@@ -12,7 +12,14 @@ collector_group=data-puller
 collector_id=10001
 deploy_root=/opt/ft-shadow-data-plane/deploy/vultr
 config_root=/etc/ft-shadow-data-plane
-data_root=/srv/ft-data-sftp
+data_root=/srv/ft-data-rsync
+
+for command_name in rsync rrsync; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        echo "missing command: $command_name" >&2
+        exit 1
+    fi
+done
 
 if getent group "$collector_group" >/dev/null 2>&1; then
     actual_gid=$(getent group "$collector_group" | cut -d: -f3)
@@ -42,9 +49,10 @@ else
         --gid "$collector_group" \
         --home-dir / \
         --no-create-home \
-        --shell /usr/sbin/nologin \
+        --shell /bin/sh \
         "$collector_user"
 fi
+usermod --shell /bin/sh "$collector_user"
 
 install -d -o root -g root -m 755 "$data_root"
 for relative_path in \
@@ -52,8 +60,7 @@ for relative_path in \
     writing \
     control \
     control/acks \
-    control/universe \
-    control/universe/inbox
+    control/universe
 do
     install -d \
         -o "$collector_id" \
@@ -69,6 +76,7 @@ install -m 644 "$script_dir/edge.yaml.example" "$deploy_root/edge.yaml.example"
 install -m 644 "$script_dir/edge.env.example" "$deploy_root/edge.env.example"
 install -m 644 "$script_dir/alert.env.example" "$deploy_root/alert.env.example"
 install -m 555 "$script_dir/verify.sh" "$deploy_root/verify.sh"
+install -m 555 "$script_dir/configure-rsync.sh" "$deploy_root/configure-rsync.sh"
 install -m 644 \
     "$script_dir/systemd/ft-shadow-data-plane.service" \
     "$deploy_root/systemd/ft-shadow-data-plane.service"
@@ -101,4 +109,4 @@ systemctl daemon-reload
 
 echo "installed Vultr deployment files"
 echo "next: edit $config_root/*.yaml and $config_root/*.env"
-echo "then: configure restricted SFTP before enabling the service"
+echo "then: run $deploy_root/configure-rsync.sh /path/to/campus-key.pub"
