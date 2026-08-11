@@ -172,6 +172,15 @@ journalctl -u ft-shadow-data-plane.service --since '24 hours ago' \
 池数量与每次评估，`decisions` 保存实际 generation。stable 池小于 65 会报警。正常日切没有
 成员变化时不会出现计划 gap；若发生替换，gap 只应列出移除和新增币。
 
+正式完整性参数为：public stream 30 秒、`markPrice@1s` 5 秒、订阅集合审计 60 秒且响应 deadline
+10 秒、前一日 seal grace 90 秒、collector lease heartbeat 30 秒。订阅集合不一致、审计 ACK 超时、刷新后没有对应
+stream 新事件、`pu/u` 不连续或异常重启都会留下 scoped gap。检查 lease 与 open gap：
+
+```bash
+sudo jq . /srv/ft-data-rsync/control/collector-lease.json
+sudo find /srv/ft-data-rsync/control/open-gaps -type f -maxdepth 1 -print
+```
+
 暂停自动选币时，把 `automation_enabled` 改为 `false` 并重启 collector；采集仍继续，core
 不能通过手工 override 直接修改。
 
@@ -187,3 +196,6 @@ p95/p99。若 OOM、RSS 峰值超过 700MiB、CPU p95 超过 80%、queue 连续�
 先在 107 安装相同 release，再更新 Vultr digest。停止服务、备份配置文件、重新运行 installer
 和 verify，再启动。v0.3.x 内升级保留 `control/universe` 与未 ACK spool；只有明确执行 clean start
 才删除它们。
+
+从 v0.3.0 升级 v0.3.1 时不要执行第 5 节 clean start；保留 generation、formal-start、ready、ACK
+和 universe evidence。服务重启会产生显式停机 gap，107 继续按 hash 幂等拉取。

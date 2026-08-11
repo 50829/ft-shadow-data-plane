@@ -55,7 +55,7 @@ shard 还按 snapshot 数量、请求间隔和 overlap 设置启动 offset：
 [edge/sources.py L1009-L1034](../src/ft_shadow_data_plane/edge/sources.py#L1009-L1034)。所以“下一次 snapshot
 何时出现”取决于连接启动相位和该 symbol 在 shard 内的抓取顺序，不能当作午夜附近的固定锚点。
 
-其他能产生 snapshot 的路径是新增 symbol、120 秒 symbol liveness refresh，以及检测到 `pu/u`
+其他能产生 snapshot 的路径是新增 symbol、public stream 30 秒 liveness refresh，以及检测到 `pu/u`
 不连续后的 reanchor：[edge/sources.py L134-L189](../src/ft_shadow_data_plane/edge/sources.py#L134-L189)、
 [edge/binance.py L396-L425](../src/ft_shadow_data_plane/edge/binance.py#L396-L425)。这些是变更或故障恢复路径，
 不能作为每日日切的常规前提。

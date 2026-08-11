@@ -13,6 +13,10 @@
 9. 确认 Vultr `ready/` 出现 chunk、107 `data/raw` 出现同一 chunk、Vultr 收到 ACK；
 10. 连续观察 24 小时资源指标、gap、ACK 延迟和剩余磁盘。
 
+v0.3.1 启动后必须确认日志没有持续的 `subscription audit`、`no mark_price event` 或 writer failure，
+`control/collector-lease.json` 为当前 boot 的 `RUNNING`，且每分钟 ACK/ready 数量有进展。一次受控重启
+应产生并在全源 ready 后关闭 `COLLECTOR_STOPPED_GAP`；不能通过删 gap 文件来获得质量通过。
+
 详细命令分别见 [Vultr 手册](../deploy/vultr/README.md) 和
 [107 手册](../deploy/campus-107/README.md)。
 

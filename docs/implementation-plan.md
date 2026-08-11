@@ -67,9 +67,18 @@ seal；它不停止或重建任何 Binance 连接，也不产生 `PLANNED_BOUNDA
 `exchange_symbols` 只包含集合差集，不包含未变化的币。因此 candidate 轮换不会让 50 个
 core 出现计划中断。
 
-WebSocket 30 秒无任何消息会重连整个异常连接。单币 120 秒没有 public event 时只刷新该币
-的订阅和快照，并记录 symbol-scoped `CONNECTION_LOST_GAP`。L2 `pu/u` 不连续时单独记录
+WebSocket 30 秒无任何消息会重连整个异常连接。每个币的 `depth` 与 `bookTicker` 分别以 30 秒
+保守阈值监控，`markPrice@1s` 以 5 秒监控；超时只刷新该币并从最后已证明事件时刻打开
+symbol/stream-scoped `CONNECTION_LOST_GAP`。刷新 ACK 不代表恢复，必须看到对应 stream 的第一条
+新事件才关闭 gap，L2 validity 还必须等待 snapshot bridge。每条连接每 60 秒执行一次
+`LIST_SUBSCRIPTIONS`，响应 deadline 为 10 秒；集合不一致或审计响应自身超时都使连接失败，gap
+从上一次成功审计的 proof timestamp 起算。`aggTrade`、`forceOrder` 和
+`contractInfo` 因天然稀疏不使用事件 deadline。L2 `pu/u` 不连续时单独记录
 `L2_SEQUENCE_GAP` 并重新取 snapshot。
+
+前一日 seal 延迟 90 秒，确保 30/60 秒监控发现的 affected interval 能先进入 day inventory。
+collector 每 30 秒写 lease；若上次启动没有 clean shutdown，下次启动会从 depth 与 market/trades
+共同 durable watermark 打开 recovered `COLLECTOR_STOPPED_GAP`，直到全部 source ready 才关闭。
 
 ## 正式起点
 
@@ -136,3 +145,22 @@ Binance 公开 USD-M 行情接口没有提供这种 market-by-order feed。可�
 transport gap OPEN 会使相关盘口失效。只有 snapshot bridge 已成功且同一 gap CLOSED 后才能重新
 产生 validity。finalize 必须拒绝空、重叠、越出目标 UTC 日或缺少 checkpoint 的结果。107 必须从
 formal start 所在 partial day 开始按 UTC 日期顺序处理，不能跳日提交。
+
+## 日质量与去重合同
+
+normalizer 从 sealed raw 的 `UNIVERSE_DECISION` 提取权威 generation、universe hash 和恰好 60 个
+成员。107 的 symbol 文件只是提交参数，必须恰好 60 个唯一大写 symbol，且 finalize 会再次要求它与
+raw 权威集合完全一致，不能靠少传 symbol 缩小验收范围。
+
+每币 expected window 在首日从 `FORMAL_COLLECTION_STARTED` 开始，其余日期覆盖完整 UTC 日。
+`_PROCESSED.json` 仅在以下条件全部满足时生成：
+
+- `valid_ratio >= 99.9%`；显式 gap 仍保留在分母中；
+- `accounted_ratio == 100%` 且 `unclassified_ns == 0`；
+- VALID 与 explicit invalid 没有重叠，即 `conflicting_ns == 0`；
+- checkpoint、sealed manifest hash、generation、universe hash 和 60 币 identity 全部一致。
+
+不满足时写 `_QUALITY_REJECTED.json`，不得写成功 marker。normalizer 用 10 分钟有界 identity 状态标记
+连接 overlap replay，并通过 `_DEDUP_CHECKPOINT.json` 跨午夜继承；raw 与 typed 保留重复行供审计，
+D0 汇总排除 `is_duplicate=true`。`forceOrder` 本身每秒最多提供最新一笔，去重不会把它变成完整逐笔
+强平数据。

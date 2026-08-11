@@ -195,8 +195,15 @@ sacct -j <job-id> --format=JobID,State,Elapsed,MaxRSS,ExitCode
 
 必须从 formal start 所在的首个 partial UTC day 开始逐日提交。每个 L2 task 会生成日末
 `l2-checkpoint.json`，下一日用它继承连续盘口；如果本地已有前一天 `SEALED.json` 但尚无前一天
-`_PROCESSED.json`，`submit-day.sh` 会拒绝乱序提交。空 validity、损坏 checkpoint、区间重叠或越出
-目标 UTC 日都会使 finalize 失败。
+`_PROCESSED.json`，`submit-day.sh` 会拒绝乱序提交，L2 本身也会拒绝续日缺少前一日 checkpoint。
+空 validity、损坏 checkpoint、区间重叠、越出目标 UTC 日、未分类时间、VALID/gap 冲突、任一币
+有效率低于 99.9%，或输入名单不等于 raw 权威 60 币都会使 finalize 失败，并写
+`_QUALITY_REJECTED.json`。成功后可检查：
+
+```bash
+jq '{generation,universe_hash,quality_policy,minimum_l2_valid_ratio}' \
+  /home/scc/pb24000367/Projects/bn/data/derived/quality/collector=tokyo01/date=2026-08-12/_PROCESSED.json
+```
 
 ## 9. 常见故障
 
