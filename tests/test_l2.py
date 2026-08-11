@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import date
+import json
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pyarrow as pa
@@ -90,6 +91,268 @@ def test_new_anchored_connection_is_explicit_authority_boundary(tmp_path: Path) 
     assert '"connection_id":"a"' in lines[0]
     assert '"valid_to_ns":400' in lines[0]
     assert '"connection_id":"b"' in lines[1]
+
+
+def test_next_day_inherits_valid_checkpoint_and_continuous_diff(tmp_path: Path) -> None:
+    previous_day = date(2026, 8, 10)
+    current_day = previous_day + timedelta(days=1)
+    midnight_ns = _midnight_ns(current_day)
+    _write_typed_day(
+        tmp_path,
+        previous_day,
+        [
+            _typed_snapshot("a", 1, midnight_ns - 2_000_000_000, 100),
+            _typed_depth("a", 2, midnight_ns - 1_000_000_000, 100, 101, 99),
+        ],
+    )
+    L2DayReconstructor(
+        derived_root=tmp_path,
+        collector_id="tokyo01",
+        utc_date=previous_day,
+        exchange_symbol="BTCUSDT",
+    ).run()
+    _write_typed_day(
+        tmp_path,
+        current_day,
+        [_typed_depth("a", 3, midnight_ns + 1_000_000_000, 102, 102, 101)],
+    )
+
+    changes, intervals = L2DayReconstructor(
+        derived_root=tmp_path,
+        collector_id="tokyo01",
+        utc_date=current_day,
+        exchange_symbol="BTCUSDT",
+    ).run()
+
+    assert changes == 0
+    assert intervals == 1
+    validity = _read_json_lines(
+        tmp_path
+        / "quality/collector=tokyo01/date=2026-08-11/symbol=BTCUSDT/l2-validity.jsonl"
+    )
+    assert validity[0]["valid_from_ns"] == midnight_ns
+    checkpoint = json.loads(
+        (
+            tmp_path
+            / "quality/collector=tokyo01/date=2026-08-11/symbol=BTCUSDT/l2-checkpoint.json"
+        ).read_text()
+    )
+    assert checkpoint["state"] == "VALID"
+    assert checkpoint["previous_update_id"] == 102
+
+
+def test_midnight_transport_gap_blocks_checkpoint_until_reanchor(tmp_path: Path) -> None:
+    previous_day = date(2026, 8, 10)
+    current_day = previous_day + timedelta(days=1)
+    midnight_ns = _midnight_ns(current_day)
+    _write_typed_day(
+        tmp_path,
+        previous_day,
+        [
+            _typed_snapshot("a", 1, midnight_ns - 2_000_000_000, 100),
+            _typed_depth("a", 2, midnight_ns - 1_000_000_000, 100, 101, 99),
+        ],
+    )
+    L2DayReconstructor(
+        derived_root=tmp_path,
+        collector_id="tokyo01",
+        utc_date=previous_day,
+        exchange_symbol="BTCUSDT",
+    ).run()
+    _write_typed_day(
+        tmp_path,
+        current_day,
+        [
+            _typed_depth("a", 3, midnight_ns + 1_000_000_000, 102, 102, 101),
+            _typed_snapshot("a", 4, midnight_ns + 2_000_000_000, 102),
+            _typed_depth("a", 5, midnight_ns + 3_000_000_000, 102, 103, 101),
+        ],
+    )
+    _write_gap(
+        tmp_path,
+        current_day,
+        state="OPEN",
+        observed_ns=midnight_ns,
+    )
+    _write_gap(
+        tmp_path,
+        current_day,
+        state="CLOSED",
+        observed_ns=midnight_ns + 2_500_000_000,
+    )
+
+    _, intervals = L2DayReconstructor(
+        derived_root=tmp_path,
+        collector_id="tokyo01",
+        utc_date=current_day,
+        exchange_symbol="BTCUSDT",
+    ).run()
+
+    assert intervals == 1
+    validity = _read_json_lines(
+        tmp_path
+        / "quality/collector=tokyo01/date=2026-08-11/symbol=BTCUSDT/l2-validity.jsonl"
+    )
+    assert validity[0]["valid_from_ns"] == midnight_ns + 2_500_000_000
+
+
+def test_cross_day_sequence_discontinuity_ends_inherited_validity(tmp_path: Path) -> None:
+    previous_day = date(2026, 8, 10)
+    current_day = previous_day + timedelta(days=1)
+    midnight_ns = _midnight_ns(current_day)
+    _write_typed_day(
+        tmp_path,
+        previous_day,
+        [
+            _typed_snapshot("a", 1, midnight_ns - 2_000_000_000, 100),
+            _typed_depth("a", 2, midnight_ns - 1_000_000_000, 100, 101, 99),
+        ],
+    )
+    L2DayReconstructor(
+        derived_root=tmp_path,
+        collector_id="tokyo01",
+        utc_date=previous_day,
+        exchange_symbol="BTCUSDT",
+    ).run()
+    _write_typed_day(
+        tmp_path,
+        current_day,
+        [
+            _typed_depth("a", 3, midnight_ns + 1_000_000_000, 200, 201, 999),
+            _typed_snapshot("a", 4, midnight_ns + 2_000_000_000, 200),
+            _typed_depth("a", 5, midnight_ns + 3_000_000_000, 202, 202, 201),
+        ],
+    )
+
+    _, intervals = L2DayReconstructor(
+        derived_root=tmp_path,
+        collector_id="tokyo01",
+        utc_date=current_day,
+        exchange_symbol="BTCUSDT",
+    ).run()
+
+    assert intervals == 2
+    validity = _read_json_lines(
+        tmp_path
+        / "quality/collector=tokyo01/date=2026-08-11/symbol=BTCUSDT/l2-validity.jsonl"
+    )
+    assert validity[0]["valid_from_ns"] == midnight_ns
+    assert validity[0]["valid_to_ns"] == midnight_ns + 1_000_000_000
+    assert validity[0]["end_reason"] == "pu_discontinuity"
+    assert validity[1]["valid_from_ns"] == midnight_ns + 2_000_000_000
+
+
+def test_connection_snapshot_before_midnight_bridges_on_next_day(tmp_path: Path) -> None:
+    previous_day = date(2026, 8, 10)
+    current_day = previous_day + timedelta(days=1)
+    midnight_ns = _midnight_ns(current_day)
+    _write_typed_day(
+        tmp_path,
+        previous_day,
+        [
+            _typed_snapshot("old", 1, midnight_ns - 3_000_000_000, 100),
+            _typed_depth("old", 2, midnight_ns - 2_000_000_000, 100, 101, 99),
+            _typed_snapshot("new", 1, midnight_ns - 1_000_000_000, 200),
+        ],
+    )
+    L2DayReconstructor(
+        derived_root=tmp_path,
+        collector_id="tokyo01",
+        utc_date=previous_day,
+        exchange_symbol="BTCUSDT",
+    ).run()
+    _write_typed_day(
+        tmp_path,
+        current_day,
+        [_typed_depth("new", 2, midnight_ns + 1_000_000_000, 200, 201, 199)],
+    )
+
+    _, intervals = L2DayReconstructor(
+        derived_root=tmp_path,
+        collector_id="tokyo01",
+        utc_date=current_day,
+        exchange_symbol="BTCUSDT",
+    ).run()
+
+    assert intervals == 2
+    validity = _read_json_lines(
+        tmp_path
+        / "quality/collector=tokyo01/date=2026-08-11/symbol=BTCUSDT/l2-validity.jsonl"
+    )
+    assert validity[0]["connection_id"] == "old"
+    assert validity[0]["valid_to_ns"] == midnight_ns + 1_000_000_000
+    assert validity[1]["connection_id"] == "new"
+
+
+def test_transport_gap_on_same_connection_reopens_after_snapshot_bridge(tmp_path: Path) -> None:
+    utc_date = date(2026, 8, 10)
+    start_ns = _midnight_ns(utc_date)
+    _write_typed_day(
+        tmp_path,
+        utc_date,
+        [
+            _typed_snapshot("a", 1, start_ns + 100, 100),
+            _typed_depth("a", 2, start_ns + 200, 100, 101, 99),
+            _typed_depth("a", 3, start_ns + 400, 102, 103, 101),
+            _typed_snapshot("a", 4, start_ns + 500, 103),
+            _typed_depth("a", 5, start_ns + 600, 103, 104, 102),
+        ],
+    )
+    _write_gap(tmp_path, utc_date, state="OPEN", observed_ns=start_ns + 300)
+    _write_gap(tmp_path, utc_date, state="CLOSED", observed_ns=start_ns + 550)
+
+    _, intervals = L2DayReconstructor(
+        derived_root=tmp_path,
+        collector_id="tokyo01",
+        utc_date=utc_date,
+        exchange_symbol="BTCUSDT",
+    ).run()
+
+    assert intervals == 2
+    validity = _read_json_lines(
+        tmp_path
+        / "quality/collector=tokyo01/date=2026-08-10/symbol=BTCUSDT/l2-validity.jsonl"
+    )
+    assert validity[0]["valid_to_ns"] == start_ns + 300
+    assert validity[1]["valid_from_ns"] == start_ns + 550
+
+
+def _write_typed_day(root: Path, utc_date: date, rows: list[dict[str, object]]) -> None:
+    typed_root = root / "typed" / "collector=tokyo01" / f"date={utc_date.isoformat()}"
+    typed_root.mkdir(parents=True)
+    pq.write_table(
+        pa.Table.from_pylist(rows, schema=TYPED_EVENT_SCHEMA_V1),
+        typed_root / "depth.typed.parquet",
+    )
+
+
+def _write_gap(
+    root: Path, utc_date: date, *, state: str, observed_ns: int
+) -> None:
+    quality_root = root / "quality" / "collector=tokyo01" / f"date={utc_date.isoformat()}"
+    quality_root.mkdir(parents=True, exist_ok=True)
+    gap = {
+        "schema_version": 1,
+        "gap_id": "gap-cross-day-test",
+        "state": state,
+        "reason": "CONNECTION_LOST_GAP",
+        "collector_id": "tokyo01",
+        "connection_id": "a",
+        "exchange_symbols": ["BTCUSDT"],
+        "stream_types": ["depth"],
+        "observed_at_realtime_ns": observed_ns,
+        "detail": "test gap",
+    }
+    with (quality_root / "transport-gaps.jsonl").open("a", encoding="ascii") as target:
+        target.write(json.dumps(gap, separators=(",", ":")) + "\n")
+
+
+def _read_json_lines(path: Path) -> list[dict[str, object]]:
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def _midnight_ns(utc_date: date) -> int:
+    return int(datetime.combine(utc_date, datetime.min.time(), UTC).timestamp() * 1_000_000_000)
 
 
 def _typed_depth(

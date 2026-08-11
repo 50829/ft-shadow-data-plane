@@ -1,4 +1,4 @@
-# v0.3 正式采集实施合同
+# v0.3.1 正式采集实施合同
 
 ## 本阶段目标
 
@@ -126,3 +126,13 @@ Binance 公开 USD-M 行情接口没有提供这种 market-by-order feed。可�
 当前实验研究价差、价位深度、冲击成本、成交与 L2 order-flow imbalance，不需要 L3。
 只有研究 queue position、逐订单寿命、撤单行为或订单级成交概率时，才另立第三方数据源与
 基础设施项目；容量和来源评估见 [L3 数据评估](l3-data-assessment-2026-08-12.md)。
+
+## 跨日 L2 派生合同
+
+每个 symbol 的日处理必须原子写出 `l2-checkpoint.json`。checkpoint 保存 UTC 日末 authoritative
+盘口和 update ID，并保留恰好跨日的未完成 snapshot bridge。下一日只能从前一日、同 collector、
+同 symbol 且恰好有效到 UTC 边界的 checkpoint 继承；第一条 diff 的 `pu` 不连续时立即结束继承。
+
+transport gap OPEN 会使相关盘口失效。只有 snapshot bridge 已成功且同一 gap CLOSED 后才能重新
+产生 validity。finalize 必须拒绝空、重叠、越出目标 UTC 日或缺少 checkpoint 的结果。107 必须从
+formal start 所在 partial day 开始按 UTC 日期顺序处理，不能跳日提交。

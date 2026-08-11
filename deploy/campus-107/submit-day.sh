@@ -38,6 +38,14 @@ set +a
 : "${FT_COLLECTOR:?FT_COLLECTOR is required}"
 : "${FT_L2_CONCURRENCY:?FT_L2_CONCURRENCY is required}"
 
+previous_date=$(date -u -d "$utc_date -1 day" +%F)
+previous_raw="$FT_RAW_ROOT/collector=$FT_COLLECTOR/day-manifests/date=$previous_date/SEALED.json"
+previous_processed="$FT_DERIVED_ROOT/quality/collector=$FT_COLLECTOR/date=$previous_date/_PROCESSED.json"
+if [ -e "$previous_raw" ] && [ ! -s "$previous_processed" ]; then
+    echo "previous UTC day must be processed first: $previous_date" >&2
+    exit 1
+fi
+
 case "$FT_L2_CONCURRENCY" in
     *[!0-9]*|0|'')
         echo "FT_L2_CONCURRENCY must be a positive integer" >&2

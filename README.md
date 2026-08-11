@@ -1,6 +1,6 @@
 # ft-shadow-data-plane
 
-Binance USD-M 正式数据采集与重建流水线。v0.3.0 从 generation 1 直接采集 60 个合约：
+Binance USD-M 正式数据采集与重建流水线。v0.3.1 从 generation 1 直接采集 60 个合约：
 50 core、5 boundary、5 probe。
 
 ```text
@@ -32,3 +32,7 @@ uv run pytest -q
 
 `ready/` 中的文件只有在 107 校验 SHA-256、原子写入 `data/raw` 并回传 ACK 后才会由
 Vultr 删除。任何无法证明完整性的时间段都必须用显式 gap 事件记录。
+
+v0.3.1 在 107 派生处理中持久化每个 symbol 的日末 L2 checkpoint，次日先验证
+`connection_id` 与 `pu` 连续性再继承盘口；transport/sequence gap 会阻断继承，恢复 snapshot
+bridge 与 gap close 后才重新声明有效。正式 raw 合同和 generation 1 名单没有变化。

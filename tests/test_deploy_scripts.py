@@ -190,6 +190,54 @@ def test_submit_day_rejects_duplicate_symbols(tmp_path: Path) -> None:
     assert not sbatch_log.exists()
 
 
+def test_submit_day_rejects_out_of_order_checkpoint_processing(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    sbatch_log = tmp_path / "sbatch.log"
+    _write_fake_sbatch(fake_bin / "sbatch")
+    processing_env = _write_processing_env(tmp_path, concurrency=8)
+    symbols = tmp_path / "symbols.txt"
+    symbols.write_text("BTCUSDT\n", encoding="ascii")
+    previous_raw = (
+        tmp_path / "raw/collector=tokyo01/day-manifests/date=2026-08-09/SEALED.json"
+    )
+    previous_raw.parent.mkdir(parents=True)
+    previous_raw.write_text("{}", encoding="ascii")
+    environment = {
+        **os.environ,
+        "FT_PROCESSING_ENV": str(processing_env),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "SBATCH_LOG": str(sbatch_log),
+    }
+
+    rejected = subprocess.run(
+        [str(SUBMIT_DAY), "2026-08-10", str(symbols)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert rejected.returncode == 1
+    assert "previous UTC day must be processed first" in rejected.stderr
+    assert not sbatch_log.exists()
+
+    previous_processed = (
+        tmp_path / "derived/quality/collector=tokyo01/date=2026-08-09/_PROCESSED.json"
+    )
+    previous_processed.parent.mkdir(parents=True)
+    previous_processed.write_text("{}", encoding="ascii")
+    accepted = subprocess.run(
+        [str(SUBMIT_DAY), "2026-08-10", str(symbols)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert accepted.returncode == 0, accepted.stderr
+
+
 def _write_processing_env(tmp_path: Path, *, concurrency: int) -> Path:
     path = tmp_path / "processing.env"
     path.write_text(

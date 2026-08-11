@@ -1,6 +1,6 @@
 # Vultr 正式采集部署
 
-本手册适用于 `167.179.115.243` 上的 v0.3 collector。数据根为
+本手册适用于 `167.179.115.243` 上的 v0.3.1 collector。数据根为
 `/srv/ft-data-rsync`，collector 和受限传输账户都使用 UID/GID 10001。
 
 ## 1. 前置条件
@@ -19,7 +19,7 @@ timedatectl status
 
 ## 2. 安装目录和服务
 
-在 v0.3 仓库根目录执行：
+在 v0.3.1 仓库根目录执行：
 
 ```bash
 sudo ./deploy/vultr/install.sh
@@ -69,7 +69,7 @@ ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
 
 ## 4. 配置正式 60 币和镜像
 
-`/etc/ft-shadow-data-plane/edge.yaml` 必须使用仓库 v0.3 示例。核对三个角色为 50/5/5、
+`/etc/ft-shadow-data-plane/edge.yaml` 必须使用仓库 v0.3.1 示例。核对三个角色为 50/5/5、
 `bootstrap_evidence_sha256` 与正式报告一致、`automation_enabled: true`、public shards 为 2，
 queue 为 64MiB。不要加入旧字段。
 
@@ -93,7 +93,7 @@ docker image inspect "$EDGE_IMAGE" --format '{{json .RepoDigests}}'
 
 Compose 已固定 0.90 CPU、768MiB RAM、256 PIDs、只读 rootfs 和日志轮换。
 
-## 5. v0.3 clean start
+## 5. v0.3.1 clean start
 
 只有在确认旧数据无需保留时执行。以下删除不可恢复，目标必须逐项等于显示值：
 
@@ -185,5 +185,5 @@ p95/p99。若 OOM、RSS 峰值超过 700MiB、CPU p95 超过 80%、queue 连续�
 ## 9. 升级
 
 先在 107 安装相同 release，再更新 Vultr digest。停止服务、备份配置文件、重新运行 installer
-和 verify，再启动。v0.3 内升级保留 `control/universe` 与未 ACK spool；只有明确执行 clean start
+和 verify，再启动。v0.3.x 内升级保留 `control/universe` 与未 ACK spool；只有明确执行 clean start
 才删除它们。

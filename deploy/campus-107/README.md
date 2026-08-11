@@ -23,7 +23,7 @@ module -t avail 2>&1 | grep apptainer
 command -v crontab flock sbatch ssh
 ```
 
-需要 v0.3 的仓库目录、`ft-shadow-data-plane.sif`、对应 SHA-256 文件，以及 Vultr 已授权的
+需要 v0.3.1 的仓库目录、`ft-shadow-data-plane.sif`、对应 SHA-256 文件，以及 Vultr 已授权的
 `~/.ssh/ft-data-puller` 私钥。
 
 ## 2. clean start
@@ -56,7 +56,7 @@ rm -rf -- \
 mkdir -p /home/scc/pb24000367/Projects/bn/data
 ```
 
-## 3. 校验并安装 v0.3
+## 3. 校验并安装 v0.3.1
 
 ```bash
 cd /home/scc/pb24000367/Projects/bn/ft-shadow-data-plane
@@ -193,6 +193,11 @@ squeue -u pb24000367
 sacct -j <job-id> --format=JobID,State,Elapsed,MaxRSS,ExitCode
 ```
 
+必须从 formal start 所在的首个 partial UTC day 开始逐日提交。每个 L2 task 会生成日末
+`l2-checkpoint.json`，下一日用它继承连续盘口；如果本地已有前一天 `SEALED.json` 但尚无前一天
+`_PROCESSED.json`，`submit-day.sh` 会拒绝乱序提交。空 validity、损坏 checkpoint、区间重叠或越出
+目标 UTC 日都会使 finalize 失败。
+
 ## 9. 常见故障
 
 - `Permission denied (publickey)`：确认私钥名是 `ft-data-puller`，Vultr 已重新运行
@@ -201,6 +206,6 @@ sacct -j <job-id> --format=JobID,State,Elapsed,MaxRSS,ExitCode
 - `rrsync` 拒绝命令：Vultr 仍有旧 SSH Match 配置，或客户端使用了服务端删除/覆盖参数；
 - `apptainer: command not found`：只使用绝对路径，不依赖 cron 中的 module；
 - overlay `invalid argument`：确认镜像是 `.sandbox` 且命令包含 `exec --writable`；
-- `pull-once.sh: Permission denied`：重新运行 v0.3 installer，并检查 `stat -c '%A' runtime/pull-once.sh`；
+- `pull-once.sh: Permission denied`：重新运行 v0.3.1 installer，并检查 `stat -c '%A' runtime/pull-once.sh`；
 - raw 不增长：先看 `pull.log`，再看 `runtime/rsync/ready` 是否有 manifest，最后在 Vultr 检查
   collector 是否仍写 `ready/`。

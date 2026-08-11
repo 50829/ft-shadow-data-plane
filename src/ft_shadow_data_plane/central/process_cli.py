@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import argparse
 import logging
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
+
+import orjson
 
 from ft_shadow_data_plane.central.clock_quality import build_clock_quality
 from ft_shadow_data_plane.central.d0 import build_d0_audit
 from ft_shadow_data_plane.central.gap_ledger import build_transport_gap_ledger
-from ft_shadow_data_plane.central.l2 import L2DayReconstructor
+from ft_shadow_data_plane.central.l2 import L2CheckpointV1, L2DayReconstructor
 from ft_shadow_data_plane.central.normalize import DayNormalizer
 from ft_shadow_data_plane.contracts.serde import atomic_write_bytes, canonical_json_bytes
 
@@ -90,13 +92,30 @@ def _finalize(
         / f"collector={collector_id}"
         / f"date={utc_date.isoformat()}"
     )
-    missing = [
-        symbol
-        for symbol in symbols
-        if not (quality_root / f"symbol={symbol}" / "l2-validity.jsonl").exists()
-    ]
+    missing = []
+    empty = []
+    for symbol in symbols:
+        symbol_root = quality_root / f"symbol={symbol}"
+        validity_path = symbol_root / "l2-validity.jsonl"
+        checkpoint_path = symbol_root / "l2-checkpoint.json"
+        if not validity_path.exists() or not checkpoint_path.exists():
+            missing.append(symbol)
+            continue
+        if validity_path.stat().st_size == 0:
+            empty.append(symbol)
+            continue
+        _validate_validity(validity_path, utc_date=utc_date)
+        checkpoint = L2CheckpointV1.model_validate_json(checkpoint_path.read_bytes())
+        if (
+            checkpoint.collector_id != collector_id
+            or checkpoint.utc_date != utc_date
+            or checkpoint.exchange_symbol != symbol
+        ):
+            raise ValueError(f"L2 checkpoint identity mismatch: {checkpoint_path}")
     if missing:
         raise FileNotFoundError(f"missing L2 outputs: {','.join(missing)}")
+    if empty:
+        raise ValueError(f"empty L2 validity: {','.join(empty)}")
     atomic_write_bytes(
         quality_root / "_PROCESSED.json",
         canonical_json_bytes(
@@ -108,6 +127,34 @@ def _finalize(
             }
         ),
     )
+
+
+def _validate_validity(path: Path, *, utc_date: date) -> None:
+    day_start = int(
+        datetime.combine(utc_date, datetime.min.time(), UTC).timestamp()
+        * 1_000_000_000
+    )
+    day_end = day_start + 86_400 * 1_000_000_000
+    previous_end: int | None = None
+    with path.open("rb") as source:
+        for line_number, line in enumerate(source, start=1):
+            try:
+                interval = orjson.loads(line)
+                start = int(interval["valid_from_ns"])
+                end = int(interval["valid_to_ns"])
+            except (KeyError, TypeError, ValueError, orjson.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"invalid L2 validity row {path}:{line_number}"
+                ) from exc
+            if (
+                interval.get("schema_version") != 1
+                or not isinstance(interval.get("connection_id"), str)
+                or not interval["connection_id"]
+                or not day_start <= start < end <= day_end
+                or (previous_end is not None and start < previous_end)
+            ):
+                raise ValueError(f"invalid L2 validity ordering {path}:{line_number}")
+            previous_end = end
 
 
 if __name__ == "__main__":
