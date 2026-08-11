@@ -26,6 +26,7 @@ from ft_shadow_data_plane.edge.config import EdgeConfig
 from ft_shadow_data_plane.edge.day_index import DayIndex
 from ft_shadow_data_plane.edge.gaps import GapJournal
 from ft_shadow_data_plane.edge.ingest import IngestCoordinator
+from ft_shadow_data_plane.edge.lease import CollectorLease
 from ft_shadow_data_plane.edge.queue import ByteBoundedQueues
 from ft_shadow_data_plane.edge.sources import SourceManager
 from ft_shadow_data_plane.edge.spool import SpoolManager
@@ -99,6 +100,8 @@ class EdgeService:
             f"edge-control-{uuid4().hex}",
         )
         self._formal_start_path = config.data_root / "control" / "formal-start.json"
+        self._service_started_ns = time.time_ns()
+        self._lease = CollectorLease(config.data_root, self._boot_id)
         self._storage_gap_id: str | None = None
         self._stale_gaps: tuple[GapEventV1, ...] = ()
         self._previous_cpu = _host_cpu_sample()
@@ -110,7 +113,16 @@ class EdgeService:
     async def run(self) -> None:
         self._spool.initialize()
         self._gaps.initialize()
+        recovery_start_ns = await asyncio.to_thread(self._lease.recovery_start_ns)
+        if recovery_start_ns is not None:
+            await self._gaps.open(
+                GapReason.COLLECTOR_STOPPED,
+                exchange_symbols=self._universe_store.active.members,
+                affected_from_realtime_ns=recovery_start_ns,
+                detail="previous collector boot ended without a clean shutdown",
+            )
         self._stale_gaps = self._gaps.stale_open_events()
+        await asyncio.to_thread(self._lease.write_running, self._lease_watermark_ns())
         for gap in self._stale_gaps:
             if gap.reason is GapReason.STORAGE_EXHAUSTED:
                 self._storage_gap_id = gap.gap_id
@@ -134,11 +146,10 @@ class EdgeService:
             asyncio.create_task(self._midnight_loop(), name="utc-midnight-rotation"),
             asyncio.create_task(self._stats_loop(), name="collector-stats"),
             asyncio.create_task(self._writers.wait_for_failure(), name="writer-health"),
+            asyncio.create_task(self._lease_loop(), name="collector-lease"),
         ]
         stop_task = asyncio.create_task(self._stop.wait(), name="edge-stop")
-        done, _ = await asyncio.wait(
-            (*background, stop_task), return_when=asyncio.FIRST_COMPLETED
-        )
+        done, _ = await asyncio.wait((*background, stop_task), return_when=asyncio.FIRST_COMPLETED)
         failure: BaseException | None = None
         for task in done:
             if task is stop_task or task.cancelled():
@@ -160,6 +171,7 @@ class EdgeService:
         await self._sources.stop()
         await asyncio.gather(*background, return_exceptions=True)
         await self._writers.stop()
+        await asyncio.to_thread(self._lease.write_clean, self._lease_watermark_ns())
         if failure is not None:
             raise failure
 
@@ -175,9 +187,7 @@ class EdgeService:
                     self._storage_gap_id = await self._gaps.open(
                         GapReason.STORAGE_EXHAUSTED,
                         exchange_symbols=self._universe_store.active.members,
-                        detail=(
-                            f"spool_bytes={status.used_bytes} free_bytes={status.free_bytes}"
-                        ),
+                        detail=(f"spool_bytes={status.used_bytes} free_bytes={status.free_bytes}"),
                     )
                     await self._sources.stop()
                 elif not status.hard_limited and self._storage_gap_id is not None:
@@ -204,6 +214,11 @@ class EdgeService:
             async with self._operation_lock:
                 await self._apply_midnight_boundary(midnight)
 
+    async def _lease_loop(self) -> None:
+        while not self._stop.is_set():
+            await asyncio.to_thread(self._lease.write_running, self._lease_watermark_ns())
+            await _wait_event(self._stop, self._config.lease_heartbeat_seconds)
+
     async def _apply_midnight_boundary(self, midnight: datetime) -> None:
         previous = self._universe_store.active
         was_running = self._sources.running
@@ -211,13 +226,14 @@ class EdgeService:
         await _sleep_until(midnight)
         previous_date = midnight.date() - timedelta(days=1)
         await self._gaps.rollover(midnight)
-        decision = self._universe_store.apply_due(midnight)
+        decision = await asyncio.to_thread(self._universe_store.apply_due, midnight)
         if decision is not None:
             changed = tuple(sorted(set(previous.members) ^ set(decision.members)))
             if was_running and changed:
                 boundary_gap = await self._gaps.open(
                     GapReason.PLANNED_BOUNDARY,
                     exchange_symbols=changed,
+                    affected_from_realtime_ns=int(midnight.timestamp() * 1_000_000_000),
                     detail="live subscriptions changing at a formal universe boundary",
                 )
         active = decision or previous
@@ -235,7 +251,12 @@ class EdgeService:
                     exchange_symbols=changed,
                     detail="new subscriptions, L2 snapshots, and first OI samples are ready",
                 )
+        await self._emit_control_event(StreamType.UNIVERSE_DECISION, canonical_json_bytes(active))
+        await self._ingest.rotate(universe_hash=active.universe_hash)
+        await _wait_event(self._stop, self._config.day_seal_grace_seconds)
         await self._day_index.seal(previous_date, sealed_at=datetime.now(UTC))
+        self._lease.record_sealed(previous_date)
+        await asyncio.to_thread(self._lease.write_running, self._lease_watermark_ns())
         logger.info(
             "sealed UTC day date=%s universe_changed=%s",
             previous_date,
@@ -244,9 +265,7 @@ class EdgeService:
 
     async def _on_discovery(self, snapshot: DiscoverySnapshot) -> None:
         async with self._operation_lock:
-            decision = await asyncio.to_thread(
-                self._universe_store.observe_and_plan, snapshot
-            )
+            decision = await asyncio.to_thread(self._universe_store.observe_and_plan, snapshot)
             if decision is not None:
                 await self._emit_control_event(
                     StreamType.UNIVERSE_DECISION,
@@ -260,9 +279,11 @@ class EdgeService:
                 )
 
     async def _mark_formal_start(self) -> None:
-        if self._formal_start_path.exists():
-            return
         active = self._universe_store.active
+        await self._emit_control_event(StreamType.UNIVERSE_DECISION, canonical_json_bytes(active))
+        if self._formal_start_path.exists():
+            await self._ingest.rotate(universe_hash=active.universe_hash)
+            return
         started_at = datetime.now(UTC)
         payload = {
             "event": "FORMAL_COLLECTION_STARTED",
@@ -272,15 +293,13 @@ class EdgeService:
             "universe_hash": active.universe_hash,
         }
         await self._emit_control_event(
-            StreamType.UNIVERSE_DECISION,
-            canonical_json_bytes(active),
-        )
-        await self._emit_control_event(
             StreamType.FORMAL_COLLECTION_STARTED,
             canonical_json_bytes(payload),
         )
         await self._ingest.rotate(universe_hash=active.universe_hash)
-        atomic_write_bytes(self._formal_start_path, canonical_json_bytes(payload))
+        await asyncio.to_thread(
+            atomic_write_bytes, self._formal_start_path, canonical_json_bytes(payload)
+        )
         logger.info(
             "FORMAL_COLLECTION_STARTED experiment_id=%s generation=%d symbols=60",
             self._config.universe.experiment_id,
@@ -378,8 +397,13 @@ class EdgeService:
 
     async def _seal_completed_days(self) -> None:
         now = datetime.now(UTC)
-        for utc_date in self._day_index.completed_dates(now.date()):
+        completed = await asyncio.to_thread(self._day_index.completed_dates, now.date())
+        for utc_date in completed:
             await self._day_index.seal(utc_date, sealed_at=now)
+            self._lease.record_sealed(utc_date)
+
+    def _lease_watermark_ns(self) -> int:
+        return self._writers.metrics.durable_through_ns or self._service_started_ns
 
 
 async def _sleep_until(moment: datetime) -> None:

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import os
+import time as wall_time
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 
@@ -7,6 +10,8 @@ import pytest
 
 from ft_shadow_data_plane.contracts.models import (
     AckV1,
+    ChunkManifestV1,
+    ChunkRefV1,
     DayManifestV1,
     GapEventV1,
     GapReason,
@@ -19,6 +24,7 @@ from ft_shadow_data_plane.contracts.serde import atomic_write_bytes, canonical_j
 from ft_shadow_data_plane.edge.day_index import DayIndex
 from ft_shadow_data_plane.edge.gaps import GapJournal
 from ft_shadow_data_plane.edge.ingest import IngestCoordinator
+from ft_shadow_data_plane.edge.lease import CollectorLease
 from ft_shadow_data_plane.edge.queue import ByteBoundedQueues, QueueOverloaded
 from ft_shadow_data_plane.edge.spool import SpoolManager
 from ft_shadow_data_plane.edge.writer import ChunkLimits, WriterPool
@@ -61,9 +67,7 @@ async def test_queue_boundary_rotation_and_exact_ack(tmp_path: Path) -> None:
     assert spool.apply_acks() == 0
     assert (tmp_path / "ready" / first["data_path"]).exists()
 
-    exact = AckV1(
-        chunk_id=first["chunk_id"], sha256=first["sha256"], durable_at=datetime.now(UTC)
-    )
+    exact = AckV1(chunk_id=first["chunk_id"], sha256=first["sha256"], durable_at=datetime.now(UTC))
     atomic_write_bytes(ack_path, canonical_json_bytes(exact))
     assert spool.apply_acks() == 1
     assert not (tmp_path / "ready" / first["data_path"]).exists()
@@ -119,6 +123,117 @@ def test_spool_skips_manifest_scan_when_there_are_no_acks(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_day_index_fsync_does_not_block_the_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_fsync = os.fsync
+
+    def slow_fsync(descriptor: int) -> None:
+        wall_time.sleep(0.08)
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", slow_fsync)
+    day_index = DayIndex(tmp_path, "tokyo01")
+    chunk = ChunkRefV1(
+        chunk_id="chunk-test",
+        data_path="date=2026-08-10/writer=depth/chunk-test.parquet",
+        sha256=HASH_A,
+        size_bytes=1,
+        content_type="application/vnd.apache.parquet",
+    )
+    loop = asyncio.get_running_loop()
+
+    async def heartbeat() -> float:
+        started = loop.time()
+        await asyncio.sleep(0.005)
+        return loop.time() - started
+
+    heartbeat_task = asyncio.create_task(heartbeat())
+    await asyncio.sleep(0)
+    await day_index.record(date(2026, 8, 10), chunk)
+
+    assert await heartbeat_task < 0.04
+
+
+@pytest.mark.asyncio
+async def test_gap_artifact_write_does_not_block_the_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    day_index = DayIndex(tmp_path, "tokyo01")
+    gaps = GapJournal(
+        tmp_path,
+        collector_id="tokyo01",
+        data_contract_hash=HASH_A,
+        universe_hash=HASH_A,
+        day_index=day_index,
+        reserve_bytes=4096,
+    )
+    gaps.initialize()
+    original_write = gaps._write
+
+    def slow_write(event: GapEventV1) -> ChunkManifestV1:
+        wall_time.sleep(0.08)
+        return original_write(event)
+
+    monkeypatch.setattr(gaps, "_write", slow_write)
+    loop = asyncio.get_running_loop()
+
+    async def heartbeat() -> float:
+        started = loop.time()
+        await asyncio.sleep(0.005)
+        return loop.time() - started
+
+    heartbeat_task = asyncio.create_task(heartbeat())
+    await asyncio.sleep(0)
+    await gaps.open(GapReason.CONNECTION_LOST, exchange_symbols=("BTCUSDT",))
+
+    assert await heartbeat_task < 0.04
+
+
+@pytest.mark.asyncio
+async def test_gap_reserve_recovers_day_index_write_in_the_same_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    day_index = DayIndex(tmp_path, "tokyo01")
+    gaps = GapJournal(
+        tmp_path,
+        collector_id="tokyo01",
+        data_contract_hash=HASH_A,
+        universe_hash=HASH_A,
+        day_index=day_index,
+        reserve_bytes=4096,
+    )
+    gaps.initialize()
+    original_record = day_index._record
+    attempts = 0
+
+    def fail_first_record(utc_date: date, chunk: ChunkRefV1) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("simulated full filesystem")
+        original_record(utc_date, chunk)
+
+    monkeypatch.setattr(day_index, "_record", fail_first_record)
+
+    await gaps.open(GapReason.CONNECTION_LOST, exchange_symbols=("BTCUSDT",))
+
+    assert attempts == 2
+    assert not (tmp_path / "control/gap-journal.reserve").exists()
+
+
+def test_unclean_collector_lease_recovers_from_durable_watermark(tmp_path: Path) -> None:
+    first = CollectorLease(tmp_path, "boot-one")
+    first.write_running(123)
+
+    assert CollectorLease(tmp_path, "boot-two").recovery_start_ns() == 123
+
+    second = CollectorLease(tmp_path, "boot-two")
+    second.write_clean(456)
+    assert CollectorLease(tmp_path, "boot-three").recovery_start_ns() is None
+
+
+@pytest.mark.asyncio
 async def test_open_gap_survives_restart_until_explicit_close(tmp_path: Path) -> None:
     day_index = DayIndex(tmp_path, "tokyo01")
     gaps = GapJournal(
@@ -137,9 +252,7 @@ async def test_open_gap_survives_restart_until_explicit_close(tmp_path: Path) ->
             "ft_shadow_data_plane.edge.gaps.time_ns",
             lambda: int(opened_at.timestamp() * 1_000_000_000),
         )
-        gap_id = await gaps.open(
-            GapReason.COLLECTOR_STOPPED, exchange_symbols=("BTCUSDT",)
-        )
+        gap_id = await gaps.open(GapReason.COLLECTOR_STOPPED, exchange_symbols=("BTCUSDT",))
     await gaps.rollover(datetime(2026, 8, 11, tzinfo=UTC))
     restarted = GapJournal(
         tmp_path,
@@ -156,15 +269,11 @@ async def test_open_gap_survives_restart_until_explicit_close(tmp_path: Path) ->
             "ft_shadow_data_plane.edge.gaps.time_ns",
             lambda: int(closed_at.timestamp() * 1_000_000_000),
         )
-        await restarted.close(
-            gap_id, GapReason.COLLECTOR_STOPPED, exchange_symbols=("BTCUSDT",)
-        )
+        await restarted.close(gap_id, GapReason.COLLECTOR_STOPPED, exchange_symbols=("BTCUSDT",))
     assert restarted.stale_open_events() == ()
 
     middle_date = date(2026, 8, 12)
-    sealed = await day_index.seal(
-        middle_date, sealed_at=datetime(2026, 8, 13, 0, 6, tzinfo=UTC)
-    )
+    sealed = await day_index.seal(middle_date, sealed_at=datetime(2026, 8, 13, 0, 6, tzinfo=UTC))
     manifest = DayManifestV1.model_validate_json(sealed.read_bytes())
     events = [
         GapEventV1.model_validate_json((tmp_path / "ready" / chunk.data_path).read_bytes())

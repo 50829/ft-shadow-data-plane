@@ -6,11 +6,12 @@ from types import SimpleNamespace
 import orjson
 import pytest
 
-from ft_shadow_data_plane.central.binance import parse_typed_row
+from ft_shadow_data_plane.central.binance import logical_identity, parse_typed_row
 from ft_shadow_data_plane.contracts.models import RawEventV1, StreamType
 from ft_shadow_data_plane.edge.binance import (
     BinanceWebSocketConnection,
     SourceIdentity,
+    SubscriptionAuditError,
     decode_websocket,
 )
 
@@ -41,6 +42,67 @@ class StalledWebSocket:
         raise AssertionError("unreachable")
 
 
+class MissingSubscriptionWebSocket:
+    def __init__(self) -> None:
+        self.responses: asyncio.Queue[bytes] = asyncio.Queue()
+
+    async def __aenter__(self) -> MissingSubscriptionWebSocket:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+    async def send(self, value: str) -> None:
+        message = orjson.loads(value)
+        request_id = int(message["id"])
+        result: object = None if message["method"] == "SUBSCRIBE" else []
+        await self.responses.put(orjson.dumps({"result": result, "id": request_id}))
+
+    async def recv(self, *, decode: bool) -> bytes:
+        assert decode is False
+        return await self.responses.get()
+
+
+class MissingAuditResponseWebSocket:
+    def __init__(self) -> None:
+        self.responses: asyncio.Queue[bytes] = asyncio.Queue()
+
+    async def __aenter__(self) -> MissingAuditResponseWebSocket:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+    async def send(self, value: str) -> None:
+        message = orjson.loads(value)
+        if message["method"] == "SUBSCRIBE":
+            await self.responses.put(orjson.dumps({"result": None, "id": message["id"]}))
+
+    async def recv(self, *, decode: bool) -> bytes:
+        assert decode is False
+        try:
+            return self.responses.get_nowait()
+        except asyncio.QueueEmpty:
+            await asyncio.sleep(0.001)
+            return orjson.dumps(
+                {
+                    "stream": "btcusdt@aggTrade",
+                    "data": {
+                        "e": "aggTrade",
+                        "E": 1,
+                        "T": 1,
+                        "s": "BTCUSDT",
+                        "a": 1,
+                        "p": "1",
+                        "q": "1",
+                        "f": 1,
+                        "l": 1,
+                        "m": False,
+                    },
+                }
+            )
+
+
 class RecordingIngest:
     def __init__(self) -> None:
         self.events: list[RawEventV1] = []
@@ -54,8 +116,17 @@ class RecordingIngest:
     [
         (
             StreamType.DEPTH,
-            {"e": "depthUpdate", "E": 1, "T": 2, "s": "BTCUSDT", "U": 10,
-             "u": 11, "pu": 9, "b": [["100", "1"]], "a": [["101", "2"]]},
+            {
+                "e": "depthUpdate",
+                "E": 1,
+                "T": 2,
+                "s": "BTCUSDT",
+                "U": 10,
+                "u": 11,
+                "pu": 9,
+                "b": [["100", "1"]],
+                "a": [["101", "2"]],
+            },
             "final_update_id",
             11,
         ),
@@ -67,44 +138,100 @@ class RecordingIngest:
         ),
         (
             StreamType.BOOK_TICKER,
-            {"e": "bookTicker", "E": 1, "T": 2, "s": "BTCUSDT", "u": 12,
-             "b": "100", "B": "1", "a": "101", "A": "2"},
+            {
+                "e": "bookTicker",
+                "E": 1,
+                "T": 2,
+                "s": "BTCUSDT",
+                "u": 12,
+                "b": "100",
+                "B": "1",
+                "a": "101",
+                "A": "2",
+            },
             "bid_price",
             "100",
         ),
         (
             StreamType.AGG_TRADE,
-            {"e": "aggTrade", "E": 1, "T": 2, "s": "BTCUSDT", "a": 3,
-             "p": "100", "q": "1", "f": 4, "l": 5, "m": True},
+            {
+                "e": "aggTrade",
+                "E": 1,
+                "T": 2,
+                "s": "BTCUSDT",
+                "a": 3,
+                "p": "100",
+                "q": "1",
+                "f": 4,
+                "l": 5,
+                "m": True,
+            },
             "aggregate_trade_id",
             3,
         ),
         (
             StreamType.TRADE,
-            {"e": "trade", "E": 1, "T": 2, "s": "BTCUSDT", "t": 7,
-             "p": "100", "q": "1", "m": False},
+            {
+                "e": "trade",
+                "E": 1,
+                "T": 2,
+                "s": "BTCUSDT",
+                "t": 7,
+                "p": "100",
+                "q": "1",
+                "m": False,
+            },
             "trade_id",
             7,
         ),
         (
             StreamType.MARK_PRICE,
-            {"e": "markPriceUpdate", "E": 1, "s": "BTCUSDT", "p": "100",
-             "i": "99", "P": "0", "r": "-0.0001", "T": 8},
+            {
+                "e": "markPriceUpdate",
+                "E": 1,
+                "s": "BTCUSDT",
+                "p": "100",
+                "i": "99",
+                "P": "0",
+                "r": "-0.0001",
+                "T": 8,
+            },
             "funding_rate",
             "-0.0001",
         ),
         (
             StreamType.FORCE_ORDER,
-            {"e": "forceOrder", "E": 1, "o": {"s": "BTCUSDT", "S": "SELL",
-             "o": "LIMIT", "f": "IOC", "q": "2", "p": "100", "ap": "99",
-             "X": "FILLED", "l": "1", "z": "2", "T": 2}},
+            {
+                "e": "forceOrder",
+                "E": 1,
+                "o": {
+                    "s": "BTCUSDT",
+                    "S": "SELL",
+                    "o": "LIMIT",
+                    "f": "IOC",
+                    "q": "2",
+                    "p": "100",
+                    "ap": "99",
+                    "X": "FILLED",
+                    "l": "1",
+                    "z": "2",
+                    "T": 2,
+                },
+            },
             "side",
             "SELL",
         ),
         (
             StreamType.CONTRACT_INFO,
-            {"e": "contractInfo", "E": 1, "s": "BTCUSDT", "ct": "PERPETUAL",
-             "dt": 0, "ot": 1, "cs": "TRADING"},
+            {
+                "e": "contractInfo",
+                "E": 1,
+                "s": "BTCUSDT",
+                "ct": "PERPETUAL",
+                "dt": 0,
+                "ot": 1,
+                "cs": "TRADING",
+            },
             "contract_status",
             "TRADING",
         ),
@@ -145,6 +272,79 @@ def test_formal_stream_fixtures(
 @pytest.mark.parametrize(
     ("stream", "payload"),
     [
+        (
+            StreamType.MARK_PRICE,
+            {
+                "e": "markPriceUpdate",
+                "E": 1,
+                "s": "BTCUSDT",
+                "p": "100",
+                "i": "99",
+                "P": "0",
+                "r": "-0.0001",
+                "T": 8,
+            },
+        ),
+        (
+            StreamType.FORCE_ORDER,
+            {
+                "e": "forceOrder",
+                "E": 1,
+                "o": {
+                    "s": "BTCUSDT",
+                    "S": "SELL",
+                    "o": "LIMIT",
+                    "f": "IOC",
+                    "q": "2",
+                    "p": "100",
+                    "ap": "99",
+                    "X": "FILLED",
+                    "l": "1",
+                    "z": "2",
+                    "T": 2,
+                },
+            },
+        ),
+        (
+            StreamType.CONTRACT_INFO,
+            {
+                "e": "contractInfo",
+                "E": 1,
+                "s": "BTCUSDT",
+                "ct": "PERPETUAL",
+                "dt": 0,
+                "ot": 1,
+                "cs": "TRADING",
+            },
+        ),
+    ],
+)
+def test_overlap_market_events_have_connection_independent_identity(
+    stream: StreamType, payload: dict[str, object]
+) -> None:
+    rows = []
+    for connection, sequence in (("old", 10), ("replacement", 1)):
+        typed = parse_typed_row(
+            {
+                "stream_type": stream.value,
+                "exchange_symbol": "BTCUSDT",
+                "connection_id": connection,
+                "receive_seq": sequence,
+                "app_receive_realtime_ns": sequence,
+                "app_receive_monotonic_ns": sequence,
+                "payload_bytes": orjson.dumps(payload),
+            }
+        )
+        assert typed is not None
+        rows.append(typed)
+
+    assert logical_identity(rows[0]) is not None
+    assert logical_identity(rows[0]) == logical_identity(rows[1])
+
+
+@pytest.mark.parametrize(
+    ("stream", "payload"),
+    [
         (StreamType.MARKET_TICKERS, [{"symbol": "BTCUSDT", "quoteVolume": "1"}]),
         (StreamType.EXCHANGE_INFO, {"symbols": [{"symbol": "BTCUSDT"}]}),
     ],
@@ -152,12 +352,15 @@ def test_formal_stream_fixtures(
 def test_market_wide_payload_is_valid_discovery_evidence(
     stream: StreamType, payload: object
 ) -> None:
-    assert parse_typed_row(
-        {
-            "stream_type": stream.value,
-            "payload_bytes": orjson.dumps(payload),
-        }
-    ) is None
+    assert (
+        parse_typed_row(
+            {
+                "stream_type": stream.value,
+                "payload_bytes": orjson.dumps(payload),
+            }
+        )
+        is None
+    )
 
 
 def test_edge_depth_decode_reuses_parsed_sequence_fields() -> None:
@@ -250,3 +453,87 @@ async def test_websocket_silence_fails_the_connection(monkeypatch: pytest.Monkey
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_subscription_audit_fails_when_one_stream_disappears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    websocket = MissingSubscriptionWebSocket()
+    monkeypatch.setattr(
+        "ft_shadow_data_plane.edge.binance.connect",
+        lambda *args, **kwargs: websocket,
+    )
+
+    async def open_depth_gap(*args: object) -> str:
+        return "gap-depth"
+
+    async def close_depth_gap(*args: object) -> None:
+        return None
+
+    connection = BinanceWebSocketConnection(
+        url="wss://example.invalid/stream",
+        subscriptions=("btcusdt@aggTrade", "btcusdt@markPrice@1s"),
+        identity=SourceIdentity("tokyo01", "boot", "segment", "connection"),
+        ingest=RecordingIngest(),  # type: ignore[arg-type]
+        snapshot_requests=(),
+        rest=SimpleNamespace(),  # type: ignore[arg-type]
+        ready=asyncio.Event(),
+        stop=asyncio.Event(),
+        receive_timeout_seconds=1,
+        ping_interval_seconds=20,
+        ping_timeout_seconds=20,
+        max_queue=4,
+        max_message_bytes=2 * 1024**2,
+        updates=asyncio.Queue(),
+        on_depth_gap=open_depth_gap,
+        on_depth_reanchored=close_depth_gap,
+        subscription_audit_seconds=0.01,
+        subscription_audit_timeout_seconds=0.01,
+    )
+
+    with pytest.raises(SubscriptionAuditError, match="subscription audit mismatch") as captured:
+        await asyncio.wait_for(connection.run(), timeout=0.5)
+    assert captured.value.affected_from_realtime_ns > 0
+
+
+@pytest.mark.asyncio
+async def test_subscription_audit_response_cannot_silently_disappear(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    websocket = MissingAuditResponseWebSocket()
+    monkeypatch.setattr(
+        "ft_shadow_data_plane.edge.binance.connect",
+        lambda *args, **kwargs: websocket,
+    )
+
+    async def open_depth_gap(*args: object) -> str:
+        return "gap-depth"
+
+    async def close_depth_gap(*args: object) -> None:
+        return None
+
+    connection = BinanceWebSocketConnection(
+        url="wss://example.invalid/stream",
+        subscriptions=("btcusdt@aggTrade",),
+        identity=SourceIdentity("tokyo01", "boot", "segment", "connection"),
+        ingest=RecordingIngest(),  # type: ignore[arg-type]
+        snapshot_requests=(),
+        rest=SimpleNamespace(),  # type: ignore[arg-type]
+        ready=asyncio.Event(),
+        stop=asyncio.Event(),
+        receive_timeout_seconds=1,
+        ping_interval_seconds=20,
+        ping_timeout_seconds=20,
+        max_queue=4,
+        max_message_bytes=2 * 1024**2,
+        updates=asyncio.Queue(),
+        on_depth_gap=open_depth_gap,
+        on_depth_reanchored=close_depth_gap,
+        subscription_audit_seconds=0.01,
+        subscription_audit_timeout_seconds=0.01,
+    )
+
+    with pytest.raises(SubscriptionAuditError, match="audit response was not received") as captured:
+        await asyncio.wait_for(connection.run(), timeout=0.5)
+    assert captured.value.affected_from_realtime_ns > 0

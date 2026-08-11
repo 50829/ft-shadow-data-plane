@@ -139,9 +139,14 @@ class EdgeConfig(BaseModel):
     websocket_receive_timeout_seconds: float = Field(default=30.0, ge=5, le=300)
     websocket_ping_interval_seconds: float = Field(default=20.0, ge=5, le=60)
     websocket_ping_timeout_seconds: float = Field(default=20.0, ge=5, le=60)
+    subscription_audit_seconds: float = Field(default=60.0, ge=10, le=300)
+    subscription_audit_timeout_seconds: float = Field(default=10.0, ge=1, le=30)
     websocket_max_queue: int = Field(default=4, ge=1, le=16)
     websocket_max_message_bytes: int = Field(default=2 * 1024**2, ge=1024**2)
-    symbol_liveness_seconds: float = Field(default=120.0, ge=30, le=600)
+    public_stream_liveness_seconds: float = Field(default=30.0, ge=10, le=300)
+    mark_price_liveness_seconds: float = Field(default=5.0, ge=3, le=30)
+    day_seal_grace_seconds: float = Field(default=90.0, ge=10, le=600)
+    lease_heartbeat_seconds: float = Field(default=30.0, ge=5, le=300)
     open_interest_interval_seconds: int = Field(default=30, ge=10, le=300)
     clock_sample_interval_seconds: int = Field(default=60, ge=10, le=300)
     snapshot_request_interval_seconds: float = Field(default=2.0, ge=0.5, le=10)
@@ -163,6 +168,16 @@ class EdgeConfig(BaseModel):
     def validate_ratios(self) -> EdgeConfig:
         if self.queue_resume_ratio >= self.queue_warn_ratio:
             raise ValueError("queue_resume_ratio must be below queue_warn_ratio")
+        if self.day_seal_grace_seconds <= self.public_stream_liveness_seconds:
+            raise ValueError("day seal grace must exceed public stream liveness timeout")
+        if self.subscription_audit_seconds <= self.websocket_receive_timeout_seconds:
+            raise ValueError("subscription audit must exceed websocket receive timeout")
+        if self.subscription_audit_seconds <= self.subscription_audit_timeout_seconds:
+            raise ValueError("subscription audit interval must exceed its response timeout")
+        if self.day_seal_grace_seconds <= (
+            self.subscription_audit_seconds + self.subscription_audit_timeout_seconds
+        ):
+            raise ValueError("day seal grace must exceed the subscription audit detection window")
         return self
 
 

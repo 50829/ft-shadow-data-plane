@@ -90,9 +90,7 @@ class RawEventV1:
     def __post_init__(self) -> None:
         if self.schema_version != 1:
             raise ValueError("RawEventV1 requires schema_version=1")
-        if self.exchange_symbol is not None and not SYMBOL_PATTERN.fullmatch(
-            self.exchange_symbol
-        ):
+        if self.exchange_symbol is not None and not SYMBOL_PATTERN.fullmatch(self.exchange_symbol):
             raise ValueError("invalid exchange_symbol")
         if not self.collector_id or not self.boot_id or not self.segment_id:
             raise ValueError("collector, boot, and segment identities are required")
@@ -258,7 +256,7 @@ class DayManifestV1(FrozenModel):
 
 
 class GapEventV1(FrozenModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 2
     gap_id: str = Field(min_length=8, max_length=160)
     state: GapState
     reason: GapReason
@@ -267,6 +265,7 @@ class GapEventV1(FrozenModel):
     exchange_symbols: tuple[str, ...] = ()
     stream_types: tuple[StreamType, ...] = ()
     observed_at_realtime_ns: int = Field(ge=0)
+    affected_from_realtime_ns: int | None = Field(default=None, ge=0)
     detail: str = Field(default="", max_length=500)
 
     @field_validator("exchange_symbols")
@@ -275,6 +274,17 @@ class GapEventV1(FrozenModel):
         if any(not SYMBOL_PATTERN.fullmatch(value) for value in values):
             raise ValueError("gap contains an invalid exchange symbol")
         return values
+
+    @model_validator(mode="after")
+    def validate_affected_from(self) -> GapEventV1:
+        if (
+            self.affected_from_realtime_ns is not None
+            and self.affected_from_realtime_ns > self.observed_at_realtime_ns
+        ):
+            raise ValueError("gap affected_from cannot be after observation")
+        if self.state is GapState.CLOSED and self.affected_from_realtime_ns is not None:
+            raise ValueError("closed gap events cannot define affected_from")
+        return self
 
 
 class UniverseDecisionV1(FrozenModel):
@@ -325,8 +335,12 @@ class UniverseDecisionV1(FrozenModel):
         if len(set(all_members)) != 60:
             raise ValueError("universe roles must contain 60 distinct members")
         if self.reason is not UniverseDecisionReason.FORMAL_BOOTSTRAP and any(
-            (self.effective_at.hour, self.effective_at.minute,
-             self.effective_at.second, self.effective_at.microsecond)
+            (
+                self.effective_at.hour,
+                self.effective_at.minute,
+                self.effective_at.second,
+                self.effective_at.microsecond,
+            )
         ):
             raise ValueError("universe changes must become effective at 00:00 UTC")
         from ft_shadow_data_plane.contracts.serde import universe_hash
@@ -364,8 +378,14 @@ class CandidateOverrideV1(FrozenModel):
     def validate_override(self) -> CandidateOverrideV1:
         if self.effective_at < self.created_at:
             raise ValueError("override cannot be effective before creation")
-        if any((self.effective_at.hour, self.effective_at.minute,
-                self.effective_at.second, self.effective_at.microsecond)):
+        if any(
+            (
+                self.effective_at.hour,
+                self.effective_at.minute,
+                self.effective_at.second,
+                self.effective_at.microsecond,
+            )
+        ):
             raise ValueError("candidate override must become effective at 00:00 UTC")
         if set(self.boundary) & set(self.probe):
             raise ValueError("candidate override roles must be disjoint")

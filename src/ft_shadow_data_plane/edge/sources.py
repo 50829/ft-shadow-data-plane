@@ -23,6 +23,7 @@ from ft_shadow_data_plane.edge.binance import (
     BinanceRestClient,
     BinanceWebSocketConnection,
     SourceIdentity,
+    SubscriptionAuditError,
     SubscriptionUpdate,
     market_subscriptions,
     public_subscriptions,
@@ -70,6 +71,9 @@ class RouteRunner:
         on_ready: Callable[[str], None] | None = None,
         subscriptions_for: Callable[[tuple[str, ...]], tuple[str, ...]] | None = None,
         liveness_timeout_seconds: float | None = None,
+        liveness_stream_types: tuple[StreamType, ...] | None = None,
+        subscription_audit_seconds: float = 60.0,
+        subscription_audit_timeout_seconds: float = 10.0,
         websocket_max_queue: int = 4,
         websocket_max_message_bytes: int = 2 * 1024**2,
     ) -> None:
@@ -97,9 +101,23 @@ class RouteRunner:
         self._updates: asyncio.Queue[SubscriptionUpdate] = asyncio.Queue(maxsize=1)
         self._update_lock = asyncio.Lock()
         self._liveness_timeout_seconds = liveness_timeout_seconds
+        self._liveness_stream_types = (
+            tuple(dict.fromkeys(liveness_stream_types or stream_types))
+            if liveness_timeout_seconds is not None
+            else ()
+        )
+        self._subscription_audit_seconds = subscription_audit_seconds
+        self._subscription_audit_timeout_seconds = subscription_audit_timeout_seconds
         self._websocket_max_queue = websocket_max_queue
         self._websocket_max_message_bytes = websocket_max_message_bytes
-        self._last_event = {symbol: time.monotonic() for symbol in instruments}
+        now = time.monotonic()
+        realtime_ns = time.time_ns()
+        self._last_event = {
+            (stream_type, symbol): (now, realtime_ns)
+            for stream_type in self._liveness_stream_types
+            for symbol in instruments
+        }
+        self._liveness_changed = asyncio.Event()
 
     @property
     def instruments(self) -> tuple[str, ...]:
@@ -127,8 +145,13 @@ class RouteRunner:
             self._subscriptions = new_subscriptions
             self._instruments = instruments
             now = time.monotonic()
+            realtime_ns = time.time_ns()
             self._last_event = {
-                symbol: self._last_event.get(symbol, now) for symbol in instruments
+                (stream_type, symbol): self._last_event.get(
+                    (stream_type, symbol), (now, realtime_ns)
+                )
+                for stream_type in self._liveness_stream_types
+                for symbol in instruments
             }
 
     async def liveness_loop(self) -> None:
@@ -137,33 +160,54 @@ class RouteRunner:
             await self._service_stop.wait()
             return
         while not self._service_stop.is_set():
-            await self._wait_or_stop(max(10.0, timeout / 2))
+            await self._wait_or_stop(max(1.0, timeout / 2))
             if self._service_stop.is_set():
                 return
             now = time.monotonic()
             stale = tuple(
-                symbol
-                for symbol, observed_at in self._last_event.items()
-                if now - observed_at >= timeout
+                (stream_type, symbol, observed_realtime_ns)
+                for (stream_type, symbol), (
+                    observed_monotonic,
+                    observed_realtime_ns,
+                ) in self._last_event.items()
+                if now - observed_monotonic >= timeout
             )
             if not stale:
                 continue
-            logger.warning("targeted subscription refresh route=%s symbols=%s", self._name, stale)
-            gap_id = await self._gaps.open(
-                GapReason.CONNECTION_LOST,
-                exchange_symbols=stale,
-                stream_types=self._stream_types,
-                detail=f"{self._name}: no per-symbol public event for {timeout:g}s",
+            stale_symbols = tuple(sorted({symbol for _stream_type, symbol, _realtime_ns in stale}))
+            logger.warning(
+                "targeted subscription refresh route=%s stale=%s",
+                self._name,
+                [(stream.value, symbol) for stream, symbol, _realtime_ns in stale],
             )
-            try:
-                await self._refresh_symbols(stale)
-                await self._gaps.close(
-                    gap_id,
+            opened = []
+            for stream_type, symbol, affected_from_ns in stale:
+                gap_id = await self._gaps.open(
                     GapReason.CONNECTION_LOST,
-                    exchange_symbols=stale,
-                    stream_types=self._stream_types,
-                    detail="targeted subscriptions and L2 snapshots refreshed",
+                    exchange_symbols=(symbol,),
+                    stream_types=(stream_type,),
+                    affected_from_realtime_ns=affected_from_ns,
+                    detail=(f"{self._name}: no {stream_type.value} event for {timeout:g}s"),
                 )
+                opened.append((gap_id, stream_type, symbol))
+            try:
+                await self._refresh_symbols(stale_symbols)
+                if self._service_stop.is_set():
+                    return
+                refreshed_after = time.monotonic()
+                await self._wait_for_fresh_events(
+                    tuple((stream_type, symbol) for stream_type, symbol, _ in stale),
+                    after=refreshed_after,
+                    timeout_seconds=timeout,
+                )
+                for gap_id, stream_type, symbol in opened:
+                    await self._gaps.close(
+                        gap_id,
+                        GapReason.CONNECTION_LOST,
+                        exchange_symbols=(symbol,),
+                        stream_types=(stream_type,),
+                        detail="targeted subscriptions and L2 snapshots refreshed",
+                    )
             except (
                 QueueOverloaded,
                 aiohttp.ClientError,
@@ -171,6 +215,7 @@ class RouteRunner:
                 TimeoutError,
             ):
                 logger.exception("targeted subscription refresh failed route=%s", self._name)
+                raise
 
     async def _refresh_symbols(self, symbols: tuple[str, ...]) -> None:
         if self._subscriptions_for is None:
@@ -187,13 +232,27 @@ class RouteRunner:
                 )
             )
             await asyncio.wait_for(completion, timeout=180)
-            refreshed_at = time.monotonic()
-            for symbol in symbols:
-                self._last_event[symbol] = refreshed_at
 
-    def _mark_event(self, _stream_type: StreamType, symbol: str | None) -> None:
-        if symbol in self._last_event:
-            self._last_event[symbol] = time.monotonic()
+    def _mark_event(self, stream_type: StreamType, symbol: str | None) -> None:
+        key = (stream_type, symbol)
+        if key in self._last_event:
+            self._last_event[key] = (time.monotonic(), time.time_ns())
+            self._liveness_changed.set()
+
+    async def _wait_for_fresh_events(
+        self,
+        keys: tuple[tuple[StreamType, str], ...],
+        *,
+        after: float,
+        timeout_seconds: float,
+    ) -> None:
+        async with asyncio.timeout(timeout_seconds):
+            while True:
+                self._liveness_changed.clear()
+                pending = [key for key in keys if self._last_event[key][0] <= after]
+                if not pending:
+                    return
+                await self._liveness_changed.wait()
 
     async def run(self) -> None:
         current: ConnectionHandle | None = None
@@ -230,7 +289,11 @@ class RouteRunner:
                     return
                 except (aiohttp.ClientError, ConnectionClosed, OSError, TimeoutError) as exc:
                     if gap_id is None:
-                        gap_id = await self._open_gap(GapReason.CONNECTION_LOST, str(exc))
+                        gap_id = await self._open_gap(
+                            GapReason.CONNECTION_LOST,
+                            str(exc),
+                            affected_from_realtime_ns=_error_affected_from(exc),
+                        )
                     await self._wait_or_stop(5)
                     continue
 
@@ -249,6 +312,7 @@ class RouteRunner:
                     gap_reason,
                     str(error or "connection closed"),
                     connection_id=current.identity.connection_id,
+                    affected_from_realtime_ns=_error_affected_from(error),
                 )
                 logger.warning(
                     "connection failed route=%s connection_id=%s gap_id=%s error=%s",
@@ -316,6 +380,8 @@ class RouteRunner:
             on_depth_gap=self._open_depth_gap,
             on_depth_reanchored=self._close_depth_gap,
             on_event=self._mark_event,
+            subscription_audit_seconds=self._subscription_audit_seconds,
+            subscription_audit_timeout_seconds=self._subscription_audit_timeout_seconds,
         )
         task = asyncio.create_task(connection.run(), name=connection_id)
         handle = ConnectionHandle(identity, ready, stop, task)
@@ -352,9 +418,7 @@ class RouteRunner:
             return ()
         requests = [(symbol, StreamType.DEPTH_SNAPSHOT) for symbol in instruments]
         if self._d0_enabled:
-            requests.extend(
-                (symbol, StreamType.RPI_DEPTH_SNAPSHOT) for symbol in instruments
-            )
+            requests.extend((symbol, StreamType.RPI_DEPTH_SNAPSHOT) for symbol in instruments)
         return tuple(requests)
 
     async def _open_depth_gap(
@@ -364,18 +428,18 @@ class RouteRunner:
         stream_type: StreamType,
         expected: int,
         received: int,
+        affected_from_realtime_ns: int,
     ) -> str:
         return await self._gaps.open(
             GapReason.L2_SEQUENCE,
             connection_id=connection_id,
             exchange_symbols=(symbol,),
             stream_types=(stream_type,),
+            affected_from_realtime_ns=affected_from_realtime_ns,
             detail=f"expected_pu={expected} received_pu={received}",
         )
 
-    async def _close_depth_gap(
-        self, gap_id: str, symbol: str, stream_type: StreamType
-    ) -> None:
+    async def _close_depth_gap(self, gap_id: str, symbol: str, stream_type: StreamType) -> None:
         await self._gaps.close(
             gap_id,
             GapReason.L2_SEQUENCE,
@@ -401,13 +465,25 @@ class RouteRunner:
         return "rotate"
 
     async def _open_gap(
-        self, reason: GapReason, detail: str, *, connection_id: str | None = None
+        self,
+        reason: GapReason,
+        detail: str,
+        *,
+        connection_id: str | None = None,
+        affected_from_realtime_ns: int | None = None,
     ) -> str:
+        affected_from_ns = affected_from_realtime_ns
+        if affected_from_ns is None:
+            affected_from_ns = min(
+                (observed[1] for observed in self._last_event.values()),
+                default=time.time_ns(),
+            )
         return await self._gaps.open(
             reason,
             connection_id=connection_id,
             exchange_symbols=self._instruments,
             stream_types=self._stream_types,
+            affected_from_realtime_ns=affected_from_ns,
             detail=f"{self._name}: {detail}"[:500],
         )
 
@@ -455,9 +531,7 @@ class RestPollers:
         )
 
     async def run(self) -> None:
-        await asyncio.gather(
-            self._open_interest_loop(), self._discovery_loop(), self._clock_loop()
-        )
+        await asyncio.gather(self._open_interest_loop(), self._discovery_loop(), self._clock_loop())
 
     async def _open_interest_loop(self) -> None:
         await self._replace_open_interest_tasks(tuple(sorted(self._instruments)))
@@ -467,9 +541,7 @@ class RestPollers:
                     if task.done() and not task.cancelled():
                         error = task.exception()
                         if error is not None:
-                            raise RuntimeError(
-                                f"open-interest task failed for {symbol}"
-                            ) from error
+                            raise RuntimeError(f"open-interest task failed for {symbol}") from error
                 await _wait_event(self._stop, 1)
         finally:
             tasks = list(self._oi_tasks.values())
@@ -623,9 +695,7 @@ class RestPollers:
                 logger.warning("discovery poll failed error=%s", exc)
                 await _wait_event(self._stop, 30)
 
-    async def _fetch_discovery(
-        self, path: str, stream_type: StreamType
-    ) -> tuple[bytes, int]:
+    async def _fetch_discovery(self, path: str, stream_type: StreamType) -> tuple[bytes, int]:
         payload, requested_at, observed_at, request_id = await self._rest.fetch(path)
         event = self._discovery_identity.event(
             stream_type=stream_type,
@@ -659,9 +729,7 @@ class RestPollers:
             }
             cached_hashes = cached_value.get("source_response_sha256s", [])
             source_hashes = (
-                [str(value) for value in cached_hashes]
-                if isinstance(cached_hashes, list)
-                else []
+                [str(value) for value in cached_hashes] if isinstance(cached_hashes, list) else []
             )
             if not source_hashes and isinstance(cached_value.get("response_sha256"), str):
                 source_hashes.append(str(cached_value["response_sha256"]))
@@ -727,9 +795,7 @@ class RestPollers:
         samples: dict[str, list[dict[str, object]]] = {symbol: [] for symbol in symbols}
         book_tickers: list[dict[str, object]] = []
         for sample_number in range(1, self._config.universe.liquidity_book_ticker_samples + 1):
-            payload, _, _, _ = await self._fetch_with_retry(
-                "/fapi/v1/ticker/bookTicker", params={}
-            )
+            payload, _, _, _ = await self._fetch_with_retry("/fapi/v1/ticker/bookTicker", params={})
             parsed = orjson.loads(payload)
             if not isinstance(parsed, list):
                 raise ValueError("book ticker response is not an array")
@@ -792,9 +858,7 @@ class RestPollers:
                 delay = min(delay * 2, 8)
         raise AssertionError("unreachable")
 
-    async def _emit_discovery_evidence(
-        self, stream_type: StreamType, payload: bytes
-    ) -> None:
+    async def _emit_discovery_evidence(self, stream_type: StreamType, payload: bytes) -> None:
         event = self._discovery_identity.event(
             stream_type=stream_type,
             exchange_symbol=None,
@@ -1018,9 +1082,7 @@ class SourceManager:
                 runner = RouteRunner(
                     name=f"public-{index}",
                     url=self._config.public_ws_url,
-                    subscriptions=public_subscriptions(
-                        shard, d0_enabled=self._config.d0_enabled
-                    ),
+                    subscriptions=public_subscriptions(shard, d0_enabled=self._config.d0_enabled),
                     instruments=shard,
                     stream_types=tuple(public_stream_types),
                     collector_id=self._collector_id,
@@ -1041,7 +1103,12 @@ class SourceManager:
                     subscriptions_for=lambda values: public_subscriptions(
                         values, d0_enabled=self._config.d0_enabled
                     ),
-                    liveness_timeout_seconds=self._config.symbol_liveness_seconds,
+                    liveness_timeout_seconds=self._config.public_stream_liveness_seconds,
+                    liveness_stream_types=(StreamType.BOOK_TICKER, StreamType.DEPTH),
+                    subscription_audit_seconds=self._config.subscription_audit_seconds,
+                    subscription_audit_timeout_seconds=(
+                        self._config.subscription_audit_timeout_seconds
+                    ),
                     websocket_max_queue=self._config.websocket_max_queue,
                     websocket_max_message_bytes=self._config.websocket_max_message_bytes,
                 )
@@ -1072,11 +1139,17 @@ class SourceManager:
                 service_stop=stop,
                 on_ready=mark_ready,
                 subscriptions_for=market_subscriptions,
+                liveness_timeout_seconds=self._config.mark_price_liveness_seconds,
+                liveness_stream_types=(StreamType.MARK_PRICE,),
+                subscription_audit_seconds=self._config.subscription_audit_seconds,
+                subscription_audit_timeout_seconds=(
+                    self._config.subscription_audit_timeout_seconds
+                ),
                 websocket_max_queue=self._config.websocket_max_queue,
                 websocket_max_message_bytes=self._config.websocket_max_message_bytes,
             )
             self._routes["market-0"] = market_runner
-            routes.append(market_runner.run())
+            routes.extend((market_runner.run(), market_runner.liveness_loop()))
             pollers = RestPollers(
                 config=self._config,
                 instruments=instruments,
@@ -1134,6 +1207,12 @@ def _task_error(task: asyncio.Task[None]) -> BaseException | None:
     if task.cancelled():
         return asyncio.CancelledError()
     return task.exception()
+
+
+def _error_affected_from(error: BaseException | None) -> int | None:
+    if isinstance(error, SubscriptionAuditError):
+        return error.affected_from_realtime_ns
+    return None
 
 
 async def _wait_event(event: asyncio.Event, delay_seconds: float) -> None:

@@ -33,6 +33,7 @@ def data_contract_v1(
         "depth_snapshot_limit": 1000,
         "d0_enabled": d0_enabled,
         "exchange": "binance_usdm",
+        "gap_schema": 2,
         "mark_price_interval_ms": 1000,
         "open_interest_interval_seconds": open_interest_interval_seconds,
         "raw_schema": 1,

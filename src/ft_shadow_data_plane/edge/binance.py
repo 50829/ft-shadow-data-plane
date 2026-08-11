@@ -35,9 +35,17 @@ class SubscriptionUpdate:
     completion: asyncio.Future[None]
 
 
+class SubscriptionAuditError(OSError):
+    def __init__(self, message: str, *, affected_from_realtime_ns: int) -> None:
+        super().__init__(message)
+        self.affected_from_realtime_ns = affected_from_realtime_ns
+
+
 @dataclass(slots=True)
 class _PendingSubscriptionUpdate:
     remaining_ids: set[int]
+    add: tuple[str, ...]
+    remove: tuple[str, ...]
     snapshot_requests: tuple[tuple[str, StreamType], ...]
     completion: asyncio.Future[None]
 
@@ -72,9 +80,7 @@ def decode_websocket(raw: bytes) -> DecodedWebSocket:
         "forceOrder": StreamType.FORCE_ORDER,
         "contractInfo": StreamType.CONTRACT_INFO,
     }
-    return DecodedWebSocket(
-        mapping.get(event_type, StreamType.UNKNOWN), symbol, message, data
-    )
+    return DecodedWebSocket(mapping.get(event_type, StreamType.UNKNOWN), symbol, message, data)
 
 
 @dataclass(slots=True)
@@ -141,13 +147,9 @@ class BinanceRestClient:
             response.raise_for_status()
         return payload, requested_at, observed_at, request_id
 
-    async def fetch_snapshot(
-        self, path: str, *, symbol: str
-    ) -> tuple[bytes, int, int, str]:
+    async def fetch_snapshot(self, path: str, *, symbol: str) -> tuple[bytes, int, int, str]:
         async with self._snapshot_lock:
-            delay = self._snapshot_interval_seconds - (
-                time.monotonic() - self._last_snapshot_at
-            )
+            delay = self._snapshot_interval_seconds - (time.monotonic() - self._last_snapshot_at)
             if delay > 0:
                 await asyncio.sleep(delay)
             result = await self.fetch(path, params={"symbol": symbol, "limit": 1000})
@@ -173,9 +175,11 @@ class BinanceWebSocketConnection:
         max_queue: int,
         max_message_bytes: int,
         updates: asyncio.Queue[SubscriptionUpdate],
-        on_depth_gap: Callable[[str, str, StreamType, int, int], Awaitable[str]],
+        on_depth_gap: Callable[[str, str, StreamType, int, int, int], Awaitable[str]],
         on_depth_reanchored: Callable[[str, str, StreamType], Awaitable[None]],
         on_event: Callable[[StreamType, str | None], None] | None = None,
+        subscription_audit_seconds: float = 60.0,
+        subscription_audit_timeout_seconds: float = 10.0,
     ) -> None:
         self._url = url
         self._subscriptions = subscriptions
@@ -194,6 +198,8 @@ class BinanceWebSocketConnection:
         self._on_depth_gap = on_depth_gap
         self._on_depth_reanchored = on_depth_reanchored
         self._on_event = on_event or (lambda _stream, _symbol: None)
+        self._subscription_audit_seconds = subscription_audit_seconds
+        self._subscription_audit_timeout_seconds = subscription_audit_timeout_seconds
         self._previous_u: dict[tuple[StreamType, str], int] = {}
         self._resync_tasks: dict[tuple[StreamType, str], asyncio.Task[None]] = {}
         self._snapshot_pending = set(snapshot_requests)
@@ -204,7 +210,12 @@ class BinanceWebSocketConnection:
         snapshot_task: asyncio.Task[None] | None = None
         update_task: asyncio.Task[SubscriptionUpdate] | None = None
         receive_task: asyncio.Task[bytes | str] | None = None
+        audit_task: asyncio.Task[None] | None = None
         pending_updates: dict[int, _PendingSubscriptionUpdate] = {}
+        pending_audits: set[int] = set()
+        active_subscriptions = set(self._subscriptions)
+        subscription_proven_realtime_ns: int | None = None
+        pending_audit_started: float | None = None
         try:
             async with connect(
                 self._url,
@@ -224,15 +235,35 @@ class BinanceWebSocketConnection:
                     ).decode()
                 )
                 update_task = asyncio.create_task(self._updates.get())
+                audit_task = asyncio.create_task(asyncio.sleep(self._subscription_audit_seconds))
                 while not self._stop.is_set():
                     if receive_task is None:
                         receive_task = asyncio.create_task(websocket.recv(decode=False))
+                    wait_timeout = self._receive_timeout_seconds
+                    if pending_audit_started is not None:
+                        wait_timeout = min(
+                            wait_timeout,
+                            max(
+                                0,
+                                self._subscription_audit_timeout_seconds
+                                - (time.monotonic() - pending_audit_started),
+                            ),
+                        )
                     try:
-                        async with asyncio.timeout(self._receive_timeout_seconds):
+                        async with asyncio.timeout(wait_timeout):
                             done, _ = await asyncio.wait(
-                                (receive_task, update_task), return_when=asyncio.FIRST_COMPLETED
+                                (receive_task, update_task, audit_task),
+                                return_when=asyncio.FIRST_COMPLETED,
                             )
                     except TimeoutError as exc:
+                        if pending_audit_started is not None:
+                            raise SubscriptionAuditError(
+                                "subscription audit response was not received within "
+                                f"{self._subscription_audit_timeout_seconds:g}s",
+                                affected_from_realtime_ns=(
+                                    subscription_proven_realtime_ns or time.time_ns()
+                                ),
+                            ) from exc
                         raise TimeoutError(
                             "no websocket message for "
                             f"{self._receive_timeout_seconds:g}s "
@@ -261,12 +292,37 @@ class BinanceWebSocketConnection:
                                 ).decode()
                             )
                         pending = _PendingSubscriptionUpdate(
-                            ids, update.snapshot_requests, update.completion
+                            ids,
+                            update.add,
+                            update.remove,
+                            update.snapshot_requests,
+                            update.completion,
                         )
                         for update_id in ids:
                             pending_updates[update_id] = pending
                         if not ids:
                             update.completion.set_result(None)
+                    if audit_task in done:
+                        if pending_audits:
+                            raise SubscriptionAuditError(
+                                "subscription audit response was not received within "
+                                f"{self._subscription_audit_timeout_seconds:g}s",
+                                affected_from_realtime_ns=(
+                                    subscription_proven_realtime_ns or time.time_ns()
+                                ),
+                            )
+                        if not pending_updates:
+                            subscription_id += 1
+                            pending_audits.add(subscription_id)
+                            pending_audit_started = time.monotonic()
+                            await websocket.send(
+                                orjson.dumps(
+                                    {"method": "LIST_SUBSCRIPTIONS", "id": subscription_id}
+                                ).decode()
+                            )
+                        audit_task = asyncio.create_task(
+                            asyncio.sleep(self._subscription_audit_seconds)
+                        )
                     if receive_task not in done:
                         continue
                     raw = receive_task.result()
@@ -288,6 +344,7 @@ class BinanceWebSocketConnection:
                     if decoded.stream_type is StreamType.WS_CONTROL and _is_subscription_ack(
                         decoded.message, initial_subscription_id
                     ):
+                        subscription_proven_realtime_ns = realtime_ns
                         if self._snapshot_requests:
                             snapshot_task = asyncio.create_task(
                                 self._fetch_snapshots(),
@@ -299,10 +356,33 @@ class BinanceWebSocketConnection:
                         if decoded.message.get("code") is not None:
                             raise OSError(f"Binance subscription rejected: {decoded.message}")
                         response_id = decoded.message.get("id")
+                        if isinstance(response_id, int) and response_id in pending_audits:
+                            pending_audits.remove(response_id)
+                            pending_audit_started = None
+                            result = decoded.message.get("result")
+                            actual = (
+                                set(result)
+                                if isinstance(result, list)
+                                and all(isinstance(value, str) for value in result)
+                                else set()
+                            )
+                            if actual != active_subscriptions:
+                                missing = sorted(active_subscriptions - actual)
+                                unexpected = sorted(actual - active_subscriptions)
+                                raise SubscriptionAuditError(
+                                    "subscription audit mismatch "
+                                    f"missing={missing} unexpected={unexpected}",
+                                    affected_from_realtime_ns=(
+                                        subscription_proven_realtime_ns or realtime_ns
+                                    ),
+                                )
+                            subscription_proven_realtime_ns = realtime_ns
                         if isinstance(response_id, int) and response_id in pending_updates:
                             pending = pending_updates.pop(response_id)
                             pending.remaining_ids.discard(response_id)
                             if not pending.remaining_ids:
+                                active_subscriptions.difference_update(pending.remove)
+                                active_subscriptions.update(pending.add)
                                 if pending.snapshot_requests:
                                     task = asyncio.create_task(
                                         self._fetch_requested_snapshots(
@@ -324,7 +404,7 @@ class BinanceWebSocketConnection:
                         and decoded.data is not None
                     ):
                         await self._check_depth_sequence(
-                            decoded.stream_type, decoded.symbol, decoded.data
+                            decoded.stream_type, decoded.symbol, decoded.data, realtime_ns
                         )
                     for key, task in tuple(self._resync_tasks.items()):
                         if task.done():
@@ -335,6 +415,8 @@ class BinanceWebSocketConnection:
                 update_task.cancel()
             if receive_task is not None:
                 receive_task.cancel()
+            if audit_task is not None:
+                audit_task.cancel()
             for pending in pending_updates.values():
                 if not pending.completion.done():
                     pending.completion.set_exception(
@@ -372,8 +454,8 @@ class BinanceWebSocketConnection:
             try:
                 is_rpi = stream_type is StreamType.RPI_DEPTH_SNAPSHOT
                 path = "/fapi/v1/rpiDepth" if is_rpi else "/fapi/v1/depth"
-                payload, requested_at, observed_at, request_id = (
-                    await self._rest.fetch_snapshot(path, symbol=symbol)
+                payload, requested_at, observed_at, request_id = await self._rest.fetch_snapshot(
+                    path, symbol=symbol
                 )
                 event = self._identity.event(
                     stream_type=stream_type,
@@ -394,7 +476,11 @@ class BinanceWebSocketConnection:
                 delay = min(delay * 2, 10)
 
     async def _check_depth_sequence(
-        self, stream_type: StreamType, symbol: str, data: dict[str, Any]
+        self,
+        stream_type: StreamType,
+        symbol: str,
+        data: dict[str, Any],
+        received_realtime_ns: int,
     ) -> None:
         previous = int(data["pu"])
         final = int(data["u"])
@@ -414,8 +500,14 @@ class BinanceWebSocketConnection:
         ):
             return
         gap_id = await self._on_depth_gap(
-            self._identity.connection_id, symbol, stream_type, expected, previous
+            self._identity.connection_id,
+            symbol,
+            stream_type,
+            expected,
+            previous,
+            received_realtime_ns,
         )
+
         async def reanchor() -> None:
             await self._fetch_snapshot(symbol, snapshot_type)
             await self._on_depth_reanchored(gap_id, symbol, stream_type)
@@ -462,7 +554,5 @@ def shard_instruments(instruments: tuple[str, ...], count: int) -> tuple[tuple[s
 
 def _is_subscription_ack(value: dict[str, Any] | None, expected_id: int) -> bool:
     return (
-        isinstance(value, dict)
-        and value.get("id") == expected_id
-        and value.get("result") is None
+        isinstance(value, dict) and value.get("id") == expected_id and value.get("result") is None
     )

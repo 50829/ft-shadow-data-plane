@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, date, datetime
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 
+from ft_shadow_data_plane.contracts.models import StreamType
 from ft_shadow_data_plane.edge.service import EdgeService
 
 
@@ -22,12 +25,14 @@ class OnlineSources:
 class BoundaryGaps:
     def __init__(self) -> None:
         self.opened_symbols: list[tuple[str, ...]] = []
+        self.affected_from_ns: list[int | None] = []
         self.closed_symbols: list[tuple[str, ...]] = []
         self.rollovers: list[datetime] = []
         self.universe_hashes: list[str] = []
 
     async def open(self, *args: object, **kwargs: object) -> str:
         self.opened_symbols.append(kwargs["exchange_symbols"])  # type: ignore[arg-type]
+        self.affected_from_ns.append(kwargs.get("affected_from_realtime_ns"))  # type: ignore[arg-type]
         return "gap-boundary"
 
     async def close(self, *args: object, **kwargs: object) -> None:
@@ -67,9 +72,25 @@ class RecordingDayIndex:
         self.seals.append(utc_date)
 
 
+class RecordingLease:
+    def __init__(self) -> None:
+        self.seals: list[date] = []
+
+    def record_sealed(self, utc_date: date) -> None:
+        self.seals.append(utc_date)
+
+    def write_running(self, _watermark: int) -> None:
+        return None
+
+
+class FakeDecision(BaseModel):
+    members: tuple[str, ...]
+    universe_hash: str
+
+
 @pytest.mark.asyncio
 async def test_midnight_without_change_keeps_all_sources_online() -> None:
-    previous = SimpleNamespace(members=_members(), universe_hash="a" * 64)
+    previous = FakeDecision(members=_members(), universe_hash="a" * 64)
     service = _service(previous, None)
     midnight = datetime(2026, 8, 11, tzinfo=UTC)
 
@@ -77,7 +98,7 @@ async def test_midnight_without_change_keeps_all_sources_online() -> None:
 
     assert service._sources.updates == []  # type: ignore[attr-defined]
     assert service._gaps.opened_symbols == []  # type: ignore[attr-defined]
-    assert service._ingest.rotations == ["a" * 64]  # type: ignore[attr-defined]
+    assert service._ingest.rotations == ["a" * 64, "a" * 64]  # type: ignore[attr-defined]
     assert service._day_index.seals == [date(2026, 8, 10)]  # type: ignore[attr-defined]
 
 
@@ -85,8 +106,8 @@ async def test_midnight_without_change_keeps_all_sources_online() -> None:
 async def test_one_symbol_change_only_marks_changed_symbols() -> None:
     previous_members = _members()
     next_members = tuple(sorted((*previous_members[:-1], "NEWUSDT")))
-    previous = SimpleNamespace(members=previous_members, universe_hash="a" * 64)
-    decision = SimpleNamespace(members=next_members, universe_hash="b" * 64)
+    previous = FakeDecision(members=previous_members, universe_hash="a" * 64)
+    decision = FakeDecision(members=next_members, universe_hash="b" * 64)
     service = _service(previous, decision)
 
     await service._apply_midnight_boundary(datetime(2026, 8, 11, tzinfo=UTC))
@@ -94,7 +115,8 @@ async def test_one_symbol_change_only_marks_changed_symbols() -> None:
     assert service._sources.updates == [next_members]  # type: ignore[attr-defined]
     assert service._gaps.opened_symbols == [("NEWUSDT", previous_members[-1])]  # type: ignore[attr-defined]
     assert service._gaps.closed_symbols == [("NEWUSDT", previous_members[-1])]  # type: ignore[attr-defined]
-    assert service._ingest.rotations == ["b" * 64]  # type: ignore[attr-defined]
+    assert service._gaps.affected_from_ns == [1_786_406_400_000_000_000]  # type: ignore[attr-defined]
+    assert service._ingest.rotations == ["b" * 64, "b" * 64]  # type: ignore[attr-defined]
 
 
 def _service(previous: object, decision: object | None) -> Any:
@@ -104,6 +126,16 @@ def _service(previous: object, decision: object | None) -> Any:
     service._universe_store = Universe(previous, decision)
     service._ingest = RecordingIngest()
     service._day_index = RecordingDayIndex()
+    service._lease = RecordingLease()
+    service._config = SimpleNamespace(day_seal_grace_seconds=0)
+    service._stop = asyncio.Event()
+    service._writers = SimpleNamespace(metrics=SimpleNamespace(durable_through_ns=1))
+    service._service_started_ns = 1
+
+    async def record_control(_stream_type: StreamType, _payload: bytes) -> None:
+        return None
+
+    service._emit_control_event = record_control
     return service
 
 

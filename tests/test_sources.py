@@ -74,9 +74,7 @@ class DailyKlineRest:
                 "10000000",
                 100000,
             ]
-            for open_ms in range(
-                int(params["startTime"]), int(params["endTime"]) + 1, day_ms
-            )
+            for open_ms in range(int(params["startTime"]), int(params["endTime"]) + 1, day_ms)
         ][: int(params["limit"])]
         return orjson.dumps(rows), 1, 2, f"request-{len(self.params)}"
 
@@ -105,6 +103,7 @@ class FakeGaps:
         *,
         exchange_symbols: tuple[str, ...],
         stream_types: tuple[StreamType, ...],
+        affected_from_realtime_ns: int | None = None,
         detail: str,
     ) -> str:
         self.opened.append((reason, exchange_symbols, stream_types))
@@ -134,6 +133,7 @@ class RouteGaps:
         connection_id: str | None = None,
         exchange_symbols: tuple[str, ...],
         stream_types: tuple[StreamType, ...],
+        affected_from_realtime_ns: int | None = None,
         detail: str,
     ) -> str:
         self.opened.append((reason, connection_id))
@@ -178,9 +178,7 @@ async def test_open_interest_failure_is_tracked_per_symbol() -> None:
 
     await asyncio.wait_for(pollers._open_interest_loop(), timeout=1)
 
-    assert gaps.opened == [
-        (GapReason.CONNECTION_LOST, ("ETHUSDT",), (StreamType.OPEN_INTEREST,))
-    ]
+    assert gaps.opened == [(GapReason.CONNECTION_LOST, ("ETHUSDT",), (StreamType.OPEN_INTEREST,))]
     assert gaps.closed == [
         (
             "gap-ethusdt",
@@ -300,6 +298,109 @@ async def test_live_update_only_changes_replaced_symbol_subscriptions() -> None:
 
 
 @pytest.mark.asyncio
+async def test_liveness_detects_depth_silence_while_book_ticker_continues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    stop = asyncio.Event()
+    gaps = FakeGaps()
+    monkeypatch.setattr("ft_shadow_data_plane.edge.sources.time.monotonic", lambda: clock[0])
+    runner = RouteRunner(
+        name="public-0",
+        url="wss://example.invalid/stream",
+        subscriptions=("btcusdt@bookTicker", "btcusdt@depth@100ms"),
+        instruments=("BTCUSDT",),
+        stream_types=(StreamType.BOOK_TICKER, StreamType.DEPTH),
+        collector_id="tokyo01",
+        boot_id="boot",
+        ingest=SimpleNamespace(),  # type: ignore[arg-type]
+        queues=FakeQueues(),  # type: ignore[arg-type]
+        gaps=gaps,  # type: ignore[arg-type]
+        rest=SimpleNamespace(),  # type: ignore[arg-type]
+        rotation_seconds=82_800,
+        overlap_seconds=15,
+        receive_timeout_seconds=30,
+        ping_interval_seconds=20,
+        ping_timeout_seconds=20,
+        service_stop=stop,
+        subscriptions_for=lambda values: public_subscriptions(values, d0_enabled=False),
+        liveness_timeout_seconds=120,
+    )
+
+    waits = 0
+
+    async def advance_clock(_seconds: float) -> None:
+        nonlocal waits
+        waits += 1
+        if waits == 1:
+            clock[0] = 121.0
+            runner._mark_event(StreamType.BOOK_TICKER, "BTCUSDT")
+        else:
+            stop.set()
+
+    async def refresh(symbols: tuple[str, ...]) -> None:
+        assert symbols == ("BTCUSDT",)
+        stop.set()
+
+    monkeypatch.setattr(runner, "_wait_or_stop", advance_clock)
+    monkeypatch.setattr(runner, "_refresh_symbols", refresh)
+
+    await asyncio.wait_for(runner.liveness_loop(), timeout=0.5)
+
+    assert gaps.opened == [(GapReason.CONNECTION_LOST, ("BTCUSDT",), (StreamType.DEPTH,))]
+
+
+@pytest.mark.asyncio
+async def test_liveness_gap_stays_open_until_the_stream_proves_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop = asyncio.Event()
+    gaps = FakeGaps()
+    runner = RouteRunner(
+        name="market-0",
+        url="wss://example.invalid/stream",
+        subscriptions=("btcusdt@markPrice@1s",),
+        instruments=("BTCUSDT",),
+        stream_types=(StreamType.MARK_PRICE,),
+        collector_id="tokyo01",
+        boot_id="boot",
+        ingest=SimpleNamespace(),  # type: ignore[arg-type]
+        queues=FakeQueues(),  # type: ignore[arg-type]
+        gaps=gaps,  # type: ignore[arg-type]
+        rest=SimpleNamespace(),  # type: ignore[arg-type]
+        rotation_seconds=82_800,
+        overlap_seconds=15,
+        receive_timeout_seconds=30,
+        ping_interval_seconds=20,
+        ping_timeout_seconds=20,
+        service_stop=stop,
+        subscriptions_for=lambda values: tuple(
+            f"{symbol.lower()}@markPrice@1s" for symbol in values
+        ),
+        liveness_timeout_seconds=0.01,
+        liveness_stream_types=(StreamType.MARK_PRICE,),
+    )
+
+    async def make_stale(_seconds: float) -> None:
+        runner._last_event[(StreamType.MARK_PRICE, "BTCUSDT")] = (
+            runner._last_event[(StreamType.MARK_PRICE, "BTCUSDT")][0] - 1,
+            1,
+        )
+
+    async def refresh_without_event(_symbols: tuple[str, ...]) -> None:
+        return None
+
+    monkeypatch.setattr(runner, "_wait_or_stop", make_stale)
+    monkeypatch.setattr(runner, "_refresh_symbols", refresh_without_event)
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(runner.liveness_loop(), timeout=0.5)
+
+    assert gaps.opened == [(GapReason.CONNECTION_LOST, ("BTCUSDT",), (StreamType.MARK_PRICE,))]
+    assert gaps.closed == []
+
+
+@pytest.mark.asyncio
 async def test_route_timeout_opens_gap_and_recovery_closes_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -352,6 +453,4 @@ async def test_route_timeout_opens_gap_and_recovery_closes_it(
     await asyncio.wait_for(runner.run(), timeout=0.5)
 
     assert gaps.opened == [(GapReason.CONNECTION_LOST, "connection-1")]
-    assert gaps.closed == [
-        ("gap-connection", GapReason.CONNECTION_LOST, "connection-2")
-    ]
+    assert gaps.closed == [("gap-connection", GapReason.CONNECTION_LOST, "connection-2")]

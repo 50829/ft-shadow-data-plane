@@ -105,9 +105,14 @@ connection_overlap_seconds: 15
 websocket_receive_timeout_seconds: 30
 websocket_ping_interval_seconds: 20
 websocket_ping_timeout_seconds: 20
+subscription_audit_seconds: 60
+subscription_audit_timeout_seconds: 10
 websocket_max_queue: 4
 websocket_max_message_bytes: 2097152
-symbol_liveness_seconds: 120
+public_stream_liveness_seconds: 30
+mark_price_liveness_seconds: 5
+day_seal_grace_seconds: 90
+lease_heartbeat_seconds: 30
 open_interest_interval_seconds: 30
 clock_sample_interval_seconds: 60
 snapshot_request_interval_seconds: 2.0

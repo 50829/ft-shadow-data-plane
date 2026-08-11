@@ -47,6 +47,7 @@ class WriterMetrics:
     events: int
     compressed_bytes: int
     max_finalize_seconds: float
+    durable_through_ns: int | None
 
 
 class ChunkSession:
@@ -207,6 +208,9 @@ class WriterPool:
             WriterGroup.TRADES_MARKET,
             WriterGroup.METADATA,
         )
+        self._durable_through_ns: dict[WriterGroup, int | None] = {
+            group: None for group in self._groups
+        }
 
     def start(self) -> None:
         if self._tasks:
@@ -218,11 +222,21 @@ class WriterPool:
 
     @property
     def metrics(self) -> WriterMetrics:
+        critical_watermarks = (
+            self._durable_through_ns[WriterGroup.DEPTH],
+            self._durable_through_ns[WriterGroup.TRADES_MARKET],
+        )
+        durable_through_ns = (
+            min(value for value in critical_watermarks if value is not None)
+            if all(value is not None for value in critical_watermarks)
+            else None
+        )
         return WriterMetrics(
             self._chunks_written,
             self._events_written,
             self._compressed_bytes,
             self._max_finalize_seconds,
+            durable_through_ns,
         )
 
     async def rotate_all(self, *, universe_hash: str) -> None:
@@ -285,6 +299,10 @@ class WriterPool:
             self._events_written += manifest.event_count
             self._compressed_bytes += manifest.size_bytes
             self._max_finalize_seconds = max(self._max_finalize_seconds, elapsed)
+            current_watermark = self._durable_through_ns[group]
+            self._durable_through_ns[group] = max(
+                current_watermark or 0, manifest.max_app_receive_realtime_ns
+            )
             session = None
 
         while True:
@@ -302,7 +320,8 @@ class WriterPool:
                 if session is not None and session.should_rotate_before(item.event, event_date):
                     await finish()
                 if session is None:
-                    session = ChunkSession(
+                    session = await asyncio.to_thread(
+                        ChunkSession,
                         self._data_root,
                         collector_id=self._collector_id,
                         writer_group=group,
@@ -341,9 +360,7 @@ class WriterPool:
                 return
 
 
-async def _wait_for_writer_stop(
-    completion: asyncio.Future[None], task: asyncio.Task[None]
-) -> None:
+async def _wait_for_writer_stop(completion: asyncio.Future[None], task: asyncio.Task[None]) -> None:
     done, _ = await asyncio.wait((completion, task), return_when=asyncio.FIRST_COMPLETED)
     if completion in done:
         await completion

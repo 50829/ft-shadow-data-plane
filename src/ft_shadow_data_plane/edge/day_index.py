@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+from collections.abc import Callable
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -27,37 +28,70 @@ class DayIndex:
 
     async def record(self, utc_date: date, chunk: ChunkRefV1) -> None:
         async with self._lock:
-            path = self._journal_path(utc_date)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("ab", buffering=0) as destination:
-                destination.write(canonical_json_bytes(chunk))
-                destination.flush()
-                import os
+            if self._sealed_path(utc_date).exists():
+                raise RuntimeError(f"cannot add a chunk to sealed UTC day {utc_date}")
+            await asyncio.to_thread(self._record, utc_date, chunk)
 
-                os.fsync(destination.fileno())
+    async def record_generated(
+        self,
+        utc_date: date,
+        create: Callable[[], ChunkManifestV1],
+        *,
+        recover_io: Callable[[], None] | None = None,
+    ) -> ChunkManifestV1:
+        async with self._lock:
+            if self._sealed_path(utc_date).exists():
+                raise RuntimeError(f"cannot publish into sealed UTC day {utc_date}")
+
+            def generate_and_record() -> ChunkManifestV1:
+                try:
+                    return self._generate_and_record(utc_date, create)
+                except OSError:
+                    if recover_io is None:
+                        raise
+                    recover_io()
+                    return self._generate_and_record(utc_date, create)
+
+            return await asyncio.to_thread(generate_and_record)
+
+    def _generate_and_record(
+        self, utc_date: date, create: Callable[[], ChunkManifestV1]
+    ) -> ChunkManifestV1:
+        manifest = create()
+        if manifest.utc_date != utc_date:
+            raise ValueError("generated chunk UTC date mismatch")
+        self._record(utc_date, manifest.as_ref())
+        return manifest
 
     async def seal(self, utc_date: date, *, sealed_at: datetime | None = None) -> Path:
         async with self._lock:
-            destination = (
-                self._data_root
-                / "ready"
-                / "day-manifests"
-                / f"date={utc_date.isoformat()}"
-                / "SEALED.json"
-            )
-            if destination.exists():
-                self._clean_sealed_day_state(utc_date)
-                return destination
-            chunks = self._read_refs(utc_date)
-            manifest = DayManifestV1(
-                collector_id=self._collector_id,
-                utc_date=utc_date,
-                sealed_at=sealed_at or datetime.now(UTC),
-                chunks=tuple(chunks),
-            )
-            atomic_write_bytes(destination, canonical_json_bytes(manifest))
+            return await asyncio.to_thread(self._seal, utc_date, sealed_at)
+
+    def _record(self, utc_date: date, chunk: ChunkRefV1) -> None:
+        path = self._journal_path(utc_date)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("ab", buffering=0) as destination:
+            destination.write(canonical_json_bytes(chunk))
+            destination.flush()
+            import os
+
+            os.fsync(destination.fileno())
+
+    def _seal(self, utc_date: date, sealed_at: datetime | None) -> Path:
+        destination = self._sealed_path(utc_date)
+        if destination.exists():
             self._clean_sealed_day_state(utc_date)
             return destination
+        chunks = self._read_refs(utc_date)
+        manifest = DayManifestV1(
+            collector_id=self._collector_id,
+            utc_date=utc_date,
+            sealed_at=sealed_at or datetime.now(UTC),
+            chunks=tuple(chunks),
+        )
+        atomic_write_bytes(destination, canonical_json_bytes(manifest))
+        self._clean_sealed_day_state(utc_date)
+        return destination
 
     def completed_dates(self, today: date) -> tuple[date, ...]:
         values: set[date] = set()
@@ -89,10 +123,7 @@ class DayIndex:
                 by_identity[(chunk.chunk_id, chunk.sha256)] = chunk
         manifest_roots = (
             self._data_root / "ready" / f"date={utc_date.isoformat()}",
-            self._data_root
-            / "control"
-            / "acked-manifests"
-            / f"date={utc_date.isoformat()}",
+            self._data_root / "control" / "acked-manifests" / f"date={utc_date.isoformat()}",
         )
         for root in manifest_roots:
             for manifest_path in root.rglob("*.manifest.json") if root.exists() else ():
@@ -104,17 +135,21 @@ class DayIndex:
     def _journal_path(self, utc_date: date) -> Path:
         return self._data_root / "control" / "day-index" / f"{utc_date.isoformat()}.jsonl"
 
+    def _sealed_path(self, utc_date: date) -> Path:
+        return (
+            self._data_root
+            / "ready"
+            / "day-manifests"
+            / f"date={utc_date.isoformat()}"
+            / "SEALED.json"
+        )
+
     def _clean_sealed_day_state(self, utc_date: date) -> None:
         journal = self._journal_path(utc_date)
         if journal.exists():
             journal.unlink()
             fsync_directory(journal.parent)
-        acked = (
-            self._data_root
-            / "control"
-            / "acked-manifests"
-            / f"date={utc_date.isoformat()}"
-        )
+        acked = self._data_root / "control" / "acked-manifests" / f"date={utc_date.isoformat()}"
         if acked.exists():
             shutil.rmtree(acked)
             fsync_directory(acked.parent)
