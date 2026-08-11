@@ -1,15 +1,32 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import os
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 from ft_shadow_data_plane.edge.config import load_edge_config
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 INSTALL_CAMPUS = PROJECT_ROOT / "deploy" / "campus-107" / "install.sh"
 SUBMIT_DAY = PROJECT_ROOT / "deploy" / "campus-107" / "submit-day.sh"
+RSYNC_GATEWAY = PROJECT_ROOT / "deploy" / "vultr" / "rsync_gateway.py"
+
+
+def _load_rsync_gateway():
+    spec = importlib.util.spec_from_file_location("rsync_gateway", RSYNC_GATEWAY)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+RSYNC_GATEWAY_MODULE = _load_rsync_gateway()
 
 
 def test_vultr_config_is_formal_sixty_and_memory_bounded() -> None:
@@ -38,6 +55,43 @@ def test_vultr_config_is_formal_sixty_and_memory_bounded() -> None:
     assert "cpus: 0.90" in compose
     assert "pids_limit: 256" in compose
     assert "--exit-code-from collector" in service
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_arguments"),
+    [
+        (
+            "rsync --server --sender -logDtpre.iLsfxCIvu . ready/",
+            ("-ro", "/srv/ft-data-rsync/ready"),
+        ),
+        (
+            "rsync --server -logDtpre.iLsfxCIvu . control/acks/",
+            ("-wo", "-no-del", "/srv/ft-data-rsync/control/acks"),
+        ),
+    ],
+)
+def test_rsync_gateway_scopes_expected_transfers(
+    command: str, expected_arguments: tuple[str, ...]
+) -> None:
+    restricted = RSYNC_GATEWAY_MODULE.restrict_command(command)
+
+    assert restricted.original_command.endswith(" . .")
+    assert restricted.rrsync_arguments == expected_arguments
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash",
+        "rsync --server -logDtpre.iLsfxCIvu . ready/",
+        "rsync --server --sender -logDtpre.iLsfxCIvu . control/acks/",
+        "rsync --server --sender -logDtpre.iLsfxCIvu . ../ready/",
+        "rsync --server --sender -logDtpre.iLsfxCIvu . ready/ control/",
+    ],
+)
+def test_rsync_gateway_rejects_out_of_scope_commands(command: str) -> None:
+    with pytest.raises(ValueError):
+        RSYNC_GATEWAY_MODULE.restrict_command(command)
 
 
 def test_campus_installer_uses_hash_named_release(tmp_path: Path) -> None:

@@ -48,13 +48,16 @@ sudo /opt/ft-shadow-data-plane/deploy/vultr/configure-rsync.sh \
   /root/ft-data-puller.pub
 ```
 
-脚本把 key 安装到 root 管理的 `AuthorizedKeysFile`，强制执行：
+脚本把 key 安装到 root 管理、`data-puller` 只读的 `AuthorizedKeysFile`，强制执行受限网关。
+网关将两种操作分别限制为：
 
 ```text
-/usr/bin/rrsync -no-del -no-overwrite /srv/ft-data-rsync
+读取 ready/         -> /usr/bin/rrsync -ro /srv/ft-data-rsync/ready
+写入 control/acks/ -> /usr/bin/rrsync -wo -no-del /srv/ft-data-rsync/control/acks
 ```
 
-该 key 没有交互 shell、TTY、端口转发或 X11 权限，不能要求服务端删除或覆盖文件。不要为
+该 key 没有交互 shell、TTY、端口转发或 X11 权限，不能写采集数据、读取其他目录或删除
+ACK。不要为
 该账户叠加其他 `ForceCommand` 或 chroot，它们会阻止 rsync 的远端进程。升级时，脚本会
 识别并禁用旧版仓库生成的 `ft-data-puller.conf`；若发现其他冲突配置，它会在 reload 前失败。
 

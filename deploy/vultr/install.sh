@@ -77,6 +77,7 @@ install -m 644 "$script_dir/edge.env.example" "$deploy_root/edge.env.example"
 install -m 644 "$script_dir/alert.env.example" "$deploy_root/alert.env.example"
 install -m 555 "$script_dir/verify.sh" "$deploy_root/verify.sh"
 install -m 555 "$script_dir/configure-rsync.sh" "$deploy_root/configure-rsync.sh"
+install -m 555 "$script_dir/rsync_gateway.py" "$deploy_root/rsync_gateway.py"
 install -m 644 \
     "$script_dir/systemd/ft-shadow-data-plane.service" \
     "$deploy_root/systemd/ft-shadow-data-plane.service"

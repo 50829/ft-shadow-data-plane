@@ -9,7 +9,7 @@ fi
 deploy_root=/opt/ft-shadow-data-plane/deploy/vultr
 config_root=/etc/ft-shadow-data-plane
 
-for command_name in docker rsync rrsync systemctl sshd; do
+for command_name in docker rsync rrsync runuser systemctl sshd; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
         echo "missing command: $command_name" >&2
         exit 1
@@ -55,8 +55,12 @@ for relative_path in ready writing control control/acks control/universe; do
         exit 1
     fi
 done
-if [ ! -r /etc/ssh/authorized_keys/data-puller ]; then
+if ! runuser -u data-puller -- test -r /etc/ssh/authorized_keys/data-puller; then
     echo "restricted rsync key is not configured" >&2
+    exit 1
+fi
+if [ ! -x "$deploy_root/rsync_gateway.py" ]; then
+    echo "restricted rsync gateway is not installed" >&2
     exit 1
 fi
 
