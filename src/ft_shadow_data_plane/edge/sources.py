@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -9,10 +10,15 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import aiohttp
+import orjson
 from websockets.exceptions import ConnectionClosed
 
-from ft_shadow_data_plane.central.selector import DiscoverySnapshot
-from ft_shadow_data_plane.contracts.models import GapReason, StreamType
+from ft_shadow_data_plane.central.selector import (
+    DiscoverySnapshot,
+    liquidity_validation_symbols,
+)
+from ft_shadow_data_plane.contracts.models import SYMBOL_PATTERN, GapReason, StreamType
+from ft_shadow_data_plane.contracts.serde import canonical_json_bytes, sha256_bytes
 from ft_shadow_data_plane.edge.binance import (
     BinanceRestClient,
     BinanceWebSocketConnection,
@@ -568,15 +574,28 @@ class RestPollers:
 
     async def _discovery_loop(self) -> None:
         gap: tuple[str, GapReason] | None = None
-        streams = (StreamType.EXCHANGE_INFO, StreamType.MARKET_TICKERS)
+        streams = (
+            StreamType.EXCHANGE_INFO,
+            StreamType.MARKET_TICKERS,
+            StreamType.DAILY_KLINES,
+            StreamType.LIQUIDITY_DEPTH,
+        )
         while not self._stop.is_set():
             try:
-                exchange_info, _ = await self._fetch_discovery(
+                exchange_info, first_observed_at = await self._fetch_discovery(
                     "/fapi/v1/exchangeInfo", StreamType.EXCHANGE_INFO
                 )
                 market_tickers, _ = await self._fetch_discovery(
                     "/fapi/v1/ticker/24hr", StreamType.MARKET_TICKERS
                 )
+                observed = datetime.fromtimestamp(first_observed_at / 1_000_000_000, UTC)
+                daily_klines = await self._fetch_daily_klines(exchange_info, observed)
+                validation_symbols = liquidity_validation_symbols(
+                    exchange_info,
+                    daily_klines,
+                    policy=self._config.universe.rolling_policy(),
+                )
+                liquidity_depth = await self._fetch_liquidity_depth(validation_symbols)
                 confirmation, observed_at = await self._fetch_discovery(
                     "/fapi/v1/exchangeInfo", StreamType.EXCHANGE_INFO
                 )
@@ -585,6 +604,8 @@ class RestPollers:
                     exchange_info=exchange_info,
                     exchange_info_confirmation=confirmation,
                     market_tickers=market_tickers,
+                    daily_klines=daily_klines,
+                    liquidity_depth=liquidity_depth,
                 )
                 await self._on_discovery(snapshot)
                 gap = await self._close_poll_gap(gap, (), streams)
@@ -617,6 +638,171 @@ class RestPollers:
         )
         await self._ingest.put(event)
         return payload, observed_at
+
+    async def _fetch_daily_klines(self, exchange_info: bytes, observed_at: datetime) -> bytes:
+        cutoff = datetime.combine(observed_at.date(), datetime.min.time(), UTC)
+        cutoff_ms = int(cutoff.timestamp() * 1000)
+        start_ms = cutoff_ms - self._config.universe.liquidity_window_days * 86_400_000
+        cached = self._cached_daily_klines()
+        responses: dict[str, dict[str, object]] = {}
+        for symbol, onboard_ms in _eligible_instruments(exchange_info).items():
+            first_full_day = ((onboard_ms + 86_400_000 - 1) // 86_400_000) * 86_400_000
+            expected = tuple(range(max(start_ms, first_full_day), cutoff_ms, 86_400_000))
+            cached_value = cached.get(symbol, {})
+            cached_payload = cached_value.get("payload", [])
+            if not isinstance(cached_payload, list):
+                cached_payload = []
+            by_open = {
+                int(row[0]): row
+                for row in cached_payload
+                if isinstance(row, list) and len(row) >= 9 and int(row[0]) in expected
+            }
+            cached_hashes = cached_value.get("source_response_sha256s", [])
+            source_hashes = (
+                [str(value) for value in cached_hashes]
+                if isinstance(cached_hashes, list)
+                else []
+            )
+            if not source_hashes and isinstance(cached_value.get("response_sha256"), str):
+                source_hashes.append(str(cached_value["response_sha256"]))
+            missing = [open_ms for open_ms in expected if open_ms not in by_open]
+            if missing:
+                payload, _, _, _ = await self._fetch_with_retry(
+                    "/fapi/v1/klines",
+                    params={
+                        "symbol": symbol,
+                        "interval": "1d",
+                        "startTime": min(missing),
+                        "endTime": cutoff_ms - 1,
+                        "limit": len(missing),
+                    },
+                )
+                parsed = orjson.loads(payload)
+                if not isinstance(parsed, list):
+                    raise ValueError(f"daily kline response is not an array for {symbol}")
+                for row in parsed:
+                    if isinstance(row, list) and len(row) >= 9 and int(row[0]) in expected:
+                        by_open[int(row[0])] = row
+                source_hashes.append(sha256_bytes(payload))
+            responses[symbol] = {
+                "payload": [by_open[open_ms] for open_ms in sorted(by_open)],
+                "source_response_sha256s": list(dict.fromkeys(source_hashes))[
+                    -(self._config.universe.liquidity_window_days + 1) :
+                ],
+            }
+        evidence = canonical_json_bytes(
+            {
+                "endpoint": "/fapi/v1/klines",
+                "interval": "1d",
+                "schema_version": 1,
+                "window_end_exclusive_ms": cutoff_ms,
+                "window_start_ms": start_ms,
+                "symbols": responses,
+            }
+        )
+        await self._emit_discovery_evidence(StreamType.DAILY_KLINES, evidence)
+        return evidence
+
+    def _cached_daily_klines(self) -> dict[str, dict[str, object]]:
+        root = self._config.data_root / "control" / "universe" / "observations"
+        paths = sorted(root.glob("*/daily-klines.json.gz"), reverse=True)
+        if not paths:
+            return {}
+        try:
+            payload = orjson.loads(gzip.decompress(paths[0].read_bytes()))
+        except (OSError, orjson.JSONDecodeError):
+            logger.warning("ignoring unreadable daily kline cache path=%s", paths[0])
+            return {}
+        symbols = payload.get("symbols") if isinstance(payload, dict) else None
+        if not isinstance(symbols, dict):
+            logger.warning("ignoring invalid daily kline cache path=%s", paths[0])
+            return {}
+        return {
+            str(symbol): value
+            for symbol, value in symbols.items()
+            if isinstance(symbol, str) and isinstance(value, dict)
+        }
+
+    async def _fetch_liquidity_depth(self, symbols: tuple[str, ...]) -> bytes:
+        samples: dict[str, list[dict[str, object]]] = {symbol: [] for symbol in symbols}
+        book_tickers: list[dict[str, object]] = []
+        for sample_number in range(1, self._config.universe.liquidity_book_ticker_samples + 1):
+            payload, _, _, _ = await self._fetch_with_retry(
+                "/fapi/v1/ticker/bookTicker", params={}
+            )
+            parsed = orjson.loads(payload)
+            if not isinstance(parsed, list):
+                raise ValueError("book ticker response is not an array")
+            book_tickers.append(
+                {
+                    "payload": parsed,
+                    "response_sha256": sha256_bytes(payload),
+                    "sample": sample_number,
+                }
+            )
+            if sample_number < self._config.universe.liquidity_book_ticker_samples:
+                await _wait_event(self._stop, 5)
+        rounds = self._config.universe.liquidity_depth_samples
+        for round_number in range(1, rounds + 1):
+            for symbol in symbols:
+                payload, _, _, _ = await self._fetch_with_retry(
+                    "/fapi/v1/depth", params={"symbol": symbol, "limit": 100}
+                )
+                parsed = orjson.loads(payload)
+                if not isinstance(parsed, dict):
+                    raise ValueError(f"depth response is not an object for {symbol}")
+                samples[symbol].append(
+                    {
+                        "payload": parsed,
+                        "response_sha256": sha256_bytes(payload),
+                        "round": round_number,
+                    }
+                )
+                await _wait_event(
+                    self._stop,
+                    self._config.universe.liquidity_request_interval_seconds,
+                )
+            if round_number < rounds:
+                await _wait_event(self._stop, 5)
+        evidence = canonical_json_bytes(
+            {
+                "depth_limit": 100,
+                "endpoint": "/fapi/v1/depth",
+                "book_ticker_endpoint": "/fapi/v1/ticker/bookTicker",
+                "book_tickers": book_tickers,
+                "rounds": rounds,
+                "schema_version": 1,
+                "symbols": samples,
+            }
+        )
+        await self._emit_discovery_evidence(StreamType.LIQUIDITY_DEPTH, evidence)
+        return evidence
+
+    async def _fetch_with_retry(
+        self, path: str, *, params: dict[str, str | int]
+    ) -> tuple[bytes, int, int, str]:
+        delay = 1.0
+        for attempt in range(4):
+            try:
+                return await self._rest.fetch(path, params=params)
+            except (aiohttp.ClientError, TimeoutError):
+                if attempt == 3:
+                    raise
+                await _wait_event(self._stop, delay)
+                delay = min(delay * 2, 8)
+        raise AssertionError("unreachable")
+
+    async def _emit_discovery_evidence(
+        self, stream_type: StreamType, payload: bytes
+    ) -> None:
+        event = self._discovery_identity.event(
+            stream_type=stream_type,
+            exchange_symbol=None,
+            payload=payload,
+            realtime_ns=time.time_ns(),
+            monotonic_ns=time.monotonic_ns(),
+        )
+        await self._ingest.put(event)
 
     def _seconds_until_discovery(self) -> float:
         now = datetime.now(UTC)
@@ -910,6 +1096,32 @@ class SourceManager:
                 await asyncio.gather(*routes)
             finally:
                 self._pollers = None
+
+
+def _eligible_instruments(exchange_info: bytes) -> dict[str, int]:
+    payload = orjson.loads(exchange_info)
+    if not isinstance(payload, dict) or not isinstance(payload.get("symbols"), list):
+        raise ValueError("exchangeInfo must contain a symbols array")
+    symbols: dict[str, int] = {}
+    for item in payload["symbols"]:
+        if not isinstance(item, dict) or not isinstance(item.get("symbol"), str):
+            raise ValueError("exchangeInfo contains an invalid symbol row")
+        symbol = str(item["symbol"])
+        if (
+            item.get("status") == "TRADING"
+            and item.get("contractType") == "PERPETUAL"
+            and item.get("quoteAsset") == "USDT"
+            and item.get("marginAsset") == "USDT"
+            and SYMBOL_PATTERN.fullmatch(symbol)
+        ):
+            try:
+                onboard_ms = int(str(item["onboardDate"]))
+            except (KeyError, ValueError) as exc:
+                raise ValueError(f"invalid onboardDate for {symbol}") from exc
+            if onboard_ms <= 0:
+                raise ValueError(f"invalid onboardDate for {symbol}")
+            symbols[symbol] = onboard_ms
+    return dict(sorted(symbols.items()))
 
 
 async def _stop_handle(handle: ConnectionHandle) -> None:

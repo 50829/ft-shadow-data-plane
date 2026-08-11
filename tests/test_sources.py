@@ -1,20 +1,27 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 from collections import Counter
+from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import aiohttp
+import orjson
 import pytest
 
 from ft_shadow_data_plane.contracts.models import GapReason, RawEventV1, StreamType
 from ft_shadow_data_plane.edge.binance import SourceIdentity, public_subscriptions
+from ft_shadow_data_plane.edge.config import load_edge_config
 from ft_shadow_data_plane.edge.sources import (
     ConnectionHandle,
     RestPollers,
     RouteRunner,
     _advance_deadline,
 )
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class FakeRest:
@@ -42,6 +49,44 @@ class FakeIngest:
         self.events.append(event)
         if {item.exchange_symbol for item in self.events} == {"BTCUSDT", "ETHUSDT"}:
             self._stop.set()
+
+
+class DailyKlineRest:
+    def __init__(self) -> None:
+        self.params: list[dict[str, str | int]] = []
+
+    async def fetch(
+        self, path: str, *, params: dict[str, str | int] | None = None
+    ) -> tuple[bytes, int, int, str]:
+        assert path == "/fapi/v1/klines"
+        assert params is not None
+        self.params.append(params)
+        day_ms = 86_400_000
+        rows = [
+            [
+                open_ms,
+                "1",
+                "1",
+                "1",
+                "1",
+                "1",
+                open_ms + day_ms - 1,
+                "10000000",
+                100000,
+            ]
+            for open_ms in range(
+                int(params["startTime"]), int(params["endTime"]) + 1, day_ms
+            )
+        ][: int(params["limit"])]
+        return orjson.dumps(rows), 1, 2, f"request-{len(self.params)}"
+
+
+class RecordingIngest:
+    def __init__(self) -> None:
+        self.events: list[RawEventV1] = []
+
+    async def put(self, event: RawEventV1) -> None:
+        self.events.append(event)
 
 
 class FakeQueues:
@@ -150,6 +195,66 @@ async def test_open_interest_failure_is_tracked_per_symbol() -> None:
 def test_fixed_rate_deadline_skips_missed_slots_without_drifting() -> None:
     assert _advance_deadline(100.0, 30.0, 101.0) == 130.0
     assert _advance_deadline(100.0, 30.0, 170.0) == 190.0
+
+
+@pytest.mark.asyncio
+async def test_daily_kline_evidence_appends_only_the_new_complete_day(
+    tmp_path: Path,
+) -> None:
+    config_path = PROJECT_ROOT / "deploy/vultr/edge.yaml.example"
+    config = load_edge_config(config_path).model_copy(update={"data_root": tmp_path})
+    rest = DailyKlineRest()
+    ingest = RecordingIngest()
+    stop = asyncio.Event()
+
+    async def ignore_discovery(value: object) -> None:
+        return None
+
+    pollers = RestPollers(
+        config=config,
+        instruments=("BTCUSDT",),
+        collector_id="tokyo01",
+        boot_id="boot",
+        ingest=ingest,  # type: ignore[arg-type]
+        queues=FakeQueues(),  # type: ignore[arg-type]
+        gaps=SimpleNamespace(),  # type: ignore[arg-type]
+        rest=rest,  # type: ignore[arg-type]
+        stop=stop,
+        on_ready=lambda _: None,
+        on_discovery=ignore_discovery,
+    )
+    exchange_info = orjson.dumps(
+        {
+            "symbols": [
+                {
+                    "symbol": "BTCUSDT",
+                    "status": "TRADING",
+                    "contractType": "PERPETUAL",
+                    "quoteAsset": "USDT",
+                    "marginAsset": "USDT",
+                    "onboardDate": 1,
+                }
+            ]
+        }
+    )
+    first = await pollers._fetch_daily_klines(
+        exchange_info, datetime(2026, 8, 17, 23, 50, tzinfo=UTC)
+    )
+    cache = tmp_path / "control/universe/observations/2026-08-17/daily-klines.json.gz"
+    cache.parent.mkdir(parents=True)
+    cache.write_bytes(gzip.compress(first))
+
+    second = await pollers._fetch_daily_klines(
+        exchange_info, datetime(2026, 8, 18, 23, 50, tzinfo=UTC)
+    )
+
+    assert [value["limit"] for value in rest.params] == [14, 1]
+    payload = orjson.loads(second)
+    assert len(payload["symbols"]["BTCUSDT"]["payload"]) == 14
+    assert [event.stream_type for event in ingest.events] == [
+        StreamType.DAILY_KLINES,
+        StreamType.DAILY_KLINES,
+    ]
 
 
 @pytest.mark.asyncio

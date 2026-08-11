@@ -28,6 +28,8 @@ class StreamType(StrEnum):
     OPEN_INTEREST = "open_interest"
     EXCHANGE_INFO = "exchange_info"
     MARKET_TICKERS = "market_tickers"
+    DAILY_KLINES = "daily_klines"
+    LIQUIDITY_DEPTH = "liquidity_depth"
     UNIVERSE_DECISION = "universe_decision"
     FORMAL_COLLECTION_STARTED = "formal_collection_started"
     CLOCK_SAMPLE = "clock_sample"

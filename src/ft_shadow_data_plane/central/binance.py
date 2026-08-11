@@ -34,6 +34,8 @@ def parse_typed_row(raw_row: dict[str, Any]) -> dict[str, Any] | None:
             raise ValueError("market tickers payload must be an array")
         object_streams = {
             StreamType.EXCHANGE_INFO,
+            StreamType.DAILY_KLINES,
+            StreamType.LIQUIDITY_DEPTH,
             StreamType.FORMAL_COLLECTION_STARTED,
             StreamType.UNIVERSE_DECISION,
             StreamType.WS_CONTROL,

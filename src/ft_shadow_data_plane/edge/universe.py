@@ -9,9 +9,9 @@ import orjson
 
 from ft_shadow_data_plane.central.selector import (
     DiscoverySnapshot,
-    RollingPolicy,
     SelectionResult,
     select_rolling_universe,
+    validate_bootstrap_universe,
 )
 from ft_shadow_data_plane.contracts.models import (
     CandidateOverrideV1,
@@ -71,6 +71,7 @@ class UniverseStore:
             core=policy.core,
             boundary=policy.boundary,
             probe=policy.probe,
+            source_hashes=(policy.bootstrap_evidence_sha256,),
             universe_hash=universe_hash(policy.core, policy.boundary, policy.probe),
         )
         self._member_since = {symbol: now for symbol in self._active.members}
@@ -88,43 +89,40 @@ class UniverseStore:
         now = now or snapshot.observed_at
         self._write_observation(snapshot)
         effective_at = _next_effective_at(now, self._policy.decision_cutoff_minute_utc)
-        snapshots = self._load_observations(self._policy.liquidity_window_days)
+        formal_start = self._root.parent / "formal-start.json"
+        if not formal_start.exists():
+            verified = validate_bootstrap_universe(
+                snapshot,
+                core=self.active.core,
+                boundary=self.active.boundary,
+                probe=self.active.probe,
+                policy=self._policy.rolling_policy(),
+            )
+            self._active = self.active.model_copy(
+                update={
+                    "source_hashes": (
+                        self._policy.bootstrap_evidence_sha256,
+                        *snapshot.source_hashes,
+                    )
+                }
+            )
+            self._write_active(self.active)
+            self._write_evaluation(verified, now=now, effective_at=now, kind="bootstrap")
+            return None
+
         result = select_rolling_universe(
             self.active,
-            snapshots,
+            snapshot,
             effective_at=effective_at,
             member_since=self._member_since,
             core_since=self._core_since,
-            policy=_rolling_policy(self._policy),
+            policy=self._policy.rolling_policy(),
         )
-        formal_start = self._root.parent / "formal-start.json"
-        if not formal_start.exists():
-            if result.inactive:
-                raise ValueError(
-                    "refusing formal start with confirmed inactive instruments: "
-                    + ",".join(result.inactive)
-                )
-            if self.active.reason is UniverseDecisionReason.FORMAL_BOOTSTRAP:
-                self._active = self.active.model_copy(
-                    update={"source_hashes": snapshot.source_hashes}
-                )
-                self._write_active(self.active)
         if not self._policy.automation_enabled:
             logger.info("automatic universe decisions are paused by configuration")
             return None
         reason = _decision_reason(self.active, result, effective_at)
-        evaluation = {
-            "active_generation": self.active.generation,
-            "boundary": list(result.boundary),
-            "core": list(result.core),
-            "effective_at": effective_at.isoformat(),
-            "evaluated_at": now.isoformat(),
-            "inactive": list(result.inactive),
-            "probe": list(result.probe),
-            "source_hashes": list(result.source_hashes),
-        }
-        evaluation_name = f"{now.strftime('%Y%m%dT%H%M%S.%fZ')}.evaluation.json"
-        atomic_write_bytes(self._evaluations / evaluation_name, canonical_json_bytes(evaluation))
+        self._write_evaluation(result, now=now, effective_at=effective_at, kind="rolling")
         if (
             result.core == self.active.core
             and result.boundary == self.active.boundary
@@ -145,6 +143,36 @@ class UniverseStore:
         )
         atomic_write_bytes(self._pending_path, canonical_json_bytes(decision))
         return decision
+
+    def _write_evaluation(
+        self,
+        result: SelectionResult,
+        *,
+        now: datetime,
+        effective_at: datetime,
+        kind: str,
+    ) -> None:
+        if result.stable_pool_count < self._policy.stable_pool_warning_size:
+            logger.warning(
+                "qualified stable pool below reserve target count=%d target=%d",
+                result.stable_pool_count,
+                self._policy.stable_pool_warning_size,
+            )
+        evaluation = {
+            "active_generation": self.active.generation,
+            "boundary": list(result.boundary),
+            "core": list(result.core),
+            "effective_at": effective_at.isoformat(),
+            "evaluated_at": now.isoformat(),
+            "inactive": list(result.inactive),
+            "kind": kind,
+            "probe": list(result.probe),
+            "probe_pool_count": result.probe_pool_count,
+            "source_hashes": list(result.source_hashes),
+            "stable_pool_count": result.stable_pool_count,
+        }
+        evaluation_name = f"{now.strftime('%Y%m%dT%H%M%S.%fZ')}.evaluation.json"
+        atomic_write_bytes(self._evaluations / evaluation_name, canonical_json_bytes(evaluation))
 
     def has_due(self, now: datetime) -> bool:
         return self._select_due(now) is not None
@@ -232,6 +260,10 @@ class UniverseStore:
             gzip.compress(snapshot.exchange_info_confirmation),
         )
         atomic_write_bytes(root / "market-tickers.json.gz", gzip.compress(snapshot.market_tickers))
+        atomic_write_bytes(root / "daily-klines.json.gz", gzip.compress(snapshot.daily_klines))
+        atomic_write_bytes(
+            root / "liquidity-depth.json.gz", gzip.compress(snapshot.liquidity_depth)
+        )
         atomic_write_bytes(
             root / "observation.json",
             canonical_json_bytes(
@@ -241,22 +273,6 @@ class UniverseStore:
                 }
             ),
         )
-
-    def _load_observations(self, limit: int) -> tuple[DiscoverySnapshot, ...]:
-        loaded: list[DiscoverySnapshot] = []
-        for root in sorted(self._observations.iterdir())[-limit:]:
-            metadata = orjson.loads((root / "observation.json").read_bytes())
-            loaded.append(
-                DiscoverySnapshot(
-                    observed_at=datetime.fromisoformat(str(metadata["observed_at"])),
-                    exchange_info=gzip.decompress((root / "exchange-info.json.gz").read_bytes()),
-                    exchange_info_confirmation=gzip.decompress(
-                        (root / "exchange-info-confirmation.json.gz").read_bytes()
-                    ),
-                    market_tickers=gzip.decompress((root / "market-tickers.json.gz").read_bytes()),
-                )
-            )
-        return tuple(loaded)
 
     def _load_state(self) -> None:
         raw = orjson.loads(self._state_path.read_bytes())
@@ -297,20 +313,6 @@ def _next_effective_at(now: datetime, cutoff_minute: int) -> datetime:
     if now.hour == 23 and now.minute > cutoff_minute:
         effective += timedelta(days=1)
     return effective
-
-
-def _rolling_policy(value: UniversePolicyConfig) -> RollingPolicy:
-    return RollingPolicy(
-        liquidity_window_days=value.liquidity_window_days,
-        candidate_minimum_dwell_hours=value.candidate_minimum_dwell_hours,
-        core_minimum_dwell_days=value.core_minimum_dwell_days,
-        candidate_daily_replacements=value.candidate_daily_replacements,
-        core_weekly_replacements=value.core_weekly_replacements,
-        core_minimum_age_days=value.core_minimum_age_days,
-        core_entry_rank=value.core_entry_rank,
-        core_retain_rank=value.core_retain_rank,
-        boundary_retain_rank=value.boundary_retain_rank,
-    )
 
 
 def _decision_reason(

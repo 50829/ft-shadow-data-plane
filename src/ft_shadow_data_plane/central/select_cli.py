@@ -5,7 +5,12 @@ import gzip
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ft_shadow_data_plane.central.selector import DiscoverySnapshot, write_formal_bundle
+from ft_shadow_data_plane.central.selector import (
+    DiscoverySnapshot,
+    RollingPolicy,
+    select_bootstrap_universe,
+    write_formal_bundle,
+)
 from ft_shadow_data_plane.contracts.models import UniverseDecisionReason, UniverseDecisionV1
 from ft_shadow_data_plane.contracts.serde import universe_hash
 
@@ -15,21 +20,24 @@ def main() -> None:
     parser.add_argument("--exchange-info", type=Path, required=True)
     parser.add_argument("--exchange-info-confirmation", type=Path, required=True)
     parser.add_argument("--market-tickers", type=Path, required=True)
-    parser.add_argument("--core", type=Path, required=True)
-    parser.add_argument("--boundary", type=Path, required=True)
-    parser.add_argument("--probe", type=Path, required=True)
+    parser.add_argument("--daily-klines", type=Path, required=True)
+    parser.add_argument("--liquidity-depth", type=Path, required=True)
+    parser.add_argument("--observed-at", type=_utc_datetime, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
     now = datetime.now(UTC)
     snapshot = DiscoverySnapshot(
-        observed_at=now,
+        observed_at=args.observed_at,
         exchange_info=_read(args.exchange_info),
         exchange_info_confirmation=_read(args.exchange_info_confirmation),
         market_tickers=_read(args.market_tickers),
+        daily_klines=_read(args.daily_klines),
+        liquidity_depth=_read(args.liquidity_depth),
     )
-    core = _members(args.core)
-    boundary = _members(args.boundary)
-    probe = _members(args.probe)
+    selected = select_bootstrap_universe(snapshot, policy=RollingPolicy())
+    core = selected.core
+    boundary = selected.boundary
+    probe = selected.probe
     decision = UniverseDecisionV1(
         generation=1,
         created_at=now,
@@ -49,8 +57,11 @@ def _read(path: Path) -> bytes:
     return gzip.decompress(content) if path.suffix == ".gz" else content
 
 
-def _members(path: Path) -> tuple[str, ...]:
-    return tuple(sorted(value.strip().upper() for value in path.read_text().splitlines() if value))
+def _utc_datetime(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(parsed):
+        raise argparse.ArgumentTypeError("timestamp must include UTC offset")
+    return parsed
 
 
 if __name__ == "__main__":

@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from ft_shadow_data_plane.contracts.models import SYMBOL_PATTERN
+from ft_shadow_data_plane.contracts.models import HASH_PATTERN, SYMBOL_PATTERN
+
+if TYPE_CHECKING:
+    from ft_shadow_data_plane.central.selector import RollingPolicy
 
 
 class UniversePolicyConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     experiment_id: str = Field(min_length=8, max_length=160)
+    bootstrap_evidence_sha256: str
     core: tuple[str, ...] = Field(min_length=50, max_length=50)
     boundary: tuple[str, ...] = Field(min_length=5, max_length=5)
     probe: tuple[str, ...] = Field(min_length=5, max_length=5)
@@ -19,7 +25,23 @@ class UniversePolicyConfig(BaseModel):
     discovery_minute_utc: int = Field(default=50, ge=0, le=59)
     decision_cutoff_minute_utc: int = Field(default=55, ge=0, le=59)
     automation_enabled: bool = True
-    liquidity_window_days: int = Field(default=7, ge=1, le=30)
+    liquidity_window_days: int = Field(default=14, ge=14, le=30)
+    probe_minimum_complete_days: int = Field(default=7, ge=1, le=14)
+    minimum_median_daily_quote_volume: Decimal = Field(default=Decimal("10000000"), gt=0)
+    minimum_q25_daily_quote_volume: Decimal = Field(default=Decimal("5000000"), gt=0)
+    minimum_daily_quote_volume: Decimal = Field(default=Decimal("3000000"), gt=0)
+    maximum_quote_volume_cv: Decimal = Field(default=Decimal("1.2"), gt=0)
+    minimum_median_daily_trades: int = Field(default=100_000, gt=0)
+    minimum_q25_daily_trades: int = Field(default=50_000, gt=0)
+    minimum_daily_trades: int = Field(default=25_000, gt=0)
+    liquidity_depth_samples: int = Field(default=3, ge=3, le=5)
+    liquidity_book_ticker_samples: int = Field(default=5, ge=3, le=10)
+    maximum_spread_bps: Decimal = Field(default=Decimal("10"), gt=0)
+    minimum_thin_depth_10bps: Decimal = Field(default=Decimal("800"), gt=0)
+    minimum_thin_depth_50bps: Decimal = Field(default=Decimal("10000"), gt=0)
+    depth_stable_candidate_count: int = Field(default=200, ge=60, le=200)
+    depth_probe_candidate_count: int = Field(default=100, ge=10, le=100)
+    liquidity_request_interval_seconds: float = Field(default=0.25, ge=0.1, le=2)
     candidate_minimum_dwell_hours: int = Field(default=48, ge=1)
     core_minimum_dwell_days: int = Field(default=14, ge=1)
     candidate_daily_replacements: int = Field(default=2, ge=1, le=2)
@@ -28,6 +50,7 @@ class UniversePolicyConfig(BaseModel):
     core_entry_rank: int = Field(default=45, ge=1, le=50)
     core_retain_rank: int = Field(default=55, ge=50)
     boundary_retain_rank: int = Field(default=10, ge=5)
+    stable_pool_warning_size: int = Field(default=65, ge=55)
 
     @field_validator("core", "boundary", "probe")
     @classmethod
@@ -39,6 +62,13 @@ class UniversePolicyConfig(BaseModel):
             raise ValueError("universe role contains duplicates")
         return normalized
 
+    @field_validator("bootstrap_evidence_sha256")
+    @classmethod
+    def validate_bootstrap_evidence_sha256(cls, value: str) -> str:
+        if not HASH_PATTERN.fullmatch(value):
+            raise ValueError("bootstrap evidence must be a lowercase SHA-256")
+        return value
+
     @model_validator(mode="after")
     def validate_roles(self) -> UniversePolicyConfig:
         members = (*self.core, *self.boundary, *self.probe)
@@ -46,11 +76,52 @@ class UniversePolicyConfig(BaseModel):
             raise ValueError("universe roles must contain 60 distinct symbols")
         if self.decision_cutoff_minute_utc <= self.discovery_minute_utc:
             raise ValueError("decision cutoff must follow discovery in the same UTC hour")
+        if self.probe_minimum_complete_days > self.liquidity_window_days:
+            raise ValueError("probe history cannot exceed the liquidity window")
+        if self.minimum_q25_daily_quote_volume > self.minimum_median_daily_quote_volume:
+            raise ValueError("q25 liquidity floor cannot exceed the median floor")
+        if self.minimum_daily_quote_volume > self.minimum_q25_daily_quote_volume:
+            raise ValueError("minimum daily liquidity cannot exceed the q25 floor")
+        if self.minimum_daily_trades > self.minimum_q25_daily_trades:
+            raise ValueError("minimum daily trades cannot exceed the q25 floor")
+        if self.minimum_q25_daily_trades > self.minimum_median_daily_trades:
+            raise ValueError("q25 daily trades cannot exceed the median floor")
         return self
 
     @property
     def members(self) -> tuple[str, ...]:
         return tuple(sorted((*self.core, *self.boundary, *self.probe)))
+
+    def rolling_policy(self) -> RollingPolicy:
+        from ft_shadow_data_plane.central.selector import RollingPolicy
+
+        return RollingPolicy(
+            liquidity_window_days=self.liquidity_window_days,
+            probe_minimum_complete_days=self.probe_minimum_complete_days,
+            minimum_median_daily_quote_volume=self.minimum_median_daily_quote_volume,
+            minimum_q25_daily_quote_volume=self.minimum_q25_daily_quote_volume,
+            minimum_daily_quote_volume=self.minimum_daily_quote_volume,
+            maximum_quote_volume_cv=self.maximum_quote_volume_cv,
+            minimum_median_daily_trades=self.minimum_median_daily_trades,
+            minimum_q25_daily_trades=self.minimum_q25_daily_trades,
+            minimum_daily_trades=self.minimum_daily_trades,
+            liquidity_depth_samples=self.liquidity_depth_samples,
+            liquidity_book_ticker_samples=self.liquidity_book_ticker_samples,
+            maximum_spread_bps=self.maximum_spread_bps,
+            minimum_thin_depth_10bps=self.minimum_thin_depth_10bps,
+            minimum_thin_depth_50bps=self.minimum_thin_depth_50bps,
+            depth_stable_candidate_count=self.depth_stable_candidate_count,
+            depth_probe_candidate_count=self.depth_probe_candidate_count,
+            candidate_minimum_dwell_hours=self.candidate_minimum_dwell_hours,
+            core_minimum_dwell_days=self.core_minimum_dwell_days,
+            candidate_daily_replacements=self.candidate_daily_replacements,
+            core_weekly_replacements=self.core_weekly_replacements,
+            core_minimum_age_days=self.core_minimum_age_days,
+            core_entry_rank=self.core_entry_rank,
+            core_retain_rank=self.core_retain_rank,
+            boundary_retain_rank=self.boundary_retain_rank,
+            stable_pool_warning_size=self.stable_pool_warning_size,
+        )
 
 
 class EdgeConfig(BaseModel):

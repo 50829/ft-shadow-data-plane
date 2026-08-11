@@ -1,6 +1,6 @@
 # Vultr 正式采集部署
 
-本手册适用于 `167.179.115.243` 上的 v0.2 collector。数据根为
+本手册适用于 `167.179.115.243` 上的 v0.3 collector。数据根为
 `/srv/ft-data-rsync`，collector 和受限传输账户都使用 UID/GID 10001。
 
 ## 1. 前置条件
@@ -19,7 +19,7 @@ timedatectl status
 
 ## 2. 安装目录和服务
 
-在 v0.2 仓库根目录执行：
+在 v0.3 仓库根目录执行：
 
 ```bash
 sudo ./deploy/vultr/install.sh
@@ -69,8 +69,9 @@ ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
 
 ## 4. 配置正式 60 币和镜像
 
-`/etc/ft-shadow-data-plane/edge.yaml` 必须使用仓库 v0.2 示例。核对三个角色为 50/5/5，
-`automation_enabled: true`，public shards 为 2，queue 为 64MiB。不要加入旧字段。
+`/etc/ft-shadow-data-plane/edge.yaml` 必须使用仓库 v0.3 示例。核对三个角色为 50/5/5、
+`bootstrap_evidence_sha256` 与正式报告一致、`automation_enabled: true`、public shards 为 2，
+queue 为 64MiB。不要加入旧字段。
 
 在 `/etc/ft-shadow-data-plane/edge.env` 中写 immutable digest：
 
@@ -92,7 +93,7 @@ docker image inspect "$EDGE_IMAGE" --format '{{json .RepoDigests}}'
 
 Compose 已固定 0.90 CPU、768MiB RAM、256 PIDs、只读 rootfs 和日志轮换。
 
-## 5. v0.2 clean start
+## 5. v0.3 clean start
 
 只有在确认旧数据无需保留时执行。以下删除不可恢复，目标必须逐项等于显示值：
 
@@ -139,8 +140,10 @@ journalctl -u ft-shadow-data-plane.service -f
 FORMAL_COLLECTION_STARTED ... generation=1 symbols=60
 ```
 
-如果两次状态请求确认初始名单中有非交易合约，collector 会拒绝写正式标记并退出。此时更新
-`edge.yaml` 的 50/5/5 角色，重新执行 clean start；不要绕过检查或减少总数。
+collector 会用最新 14 个完整 UTC 日、5 次 bookTicker 和 3 次 depth 验证冻结的 generation 1。
+若两次状态请求发现非交易合约，或任何已配置成员跌破角色硬门槛，它会拒绝写正式标记并退出。
+合格池内部因瞬时盘口产生的排名变化不会改写冻结名单。失败时必须重新冻结证据和配置，再执行
+clean start；不要绕过检查或减少总数。
 
 同时确认：
 
@@ -165,8 +168,9 @@ journalctl -u ft-shadow-data-plane.service --since '24 hours ago' \
   | grep -E 'GAP|collector status|FORMAL_COLLECTION_STARTED|planned universe'
 ```
 
-`control/universe/observations` 保存每日证据，`evaluations` 保存每次评估，`decisions` 保存实际
-generation。正常日切没有成员变化时不会出现计划 gap。若发生替换，gap 只应列出移除和新增币。
+`control/universe/observations` 保存每日增量 Kline 和盘口证据，`evaluations` 保存 stable/probe
+池数量与每次评估，`decisions` 保存实际 generation。stable 池小于 65 会报警。正常日切没有
+成员变化时不会出现计划 gap；若发生替换，gap 只应列出移除和新增币。
 
 暂停自动选币时，把 `automation_enabled` 改为 `false` 并重启 collector；采集仍继续，core
 不能通过手工 override 直接修改。
@@ -181,5 +185,5 @@ p95/p99。若 OOM、RSS 峰值超过 700MiB、CPU p95 超过 80%、queue 连续�
 ## 9. 升级
 
 先在 107 安装相同 release，再更新 Vultr digest。停止服务、备份配置文件、重新运行 installer
-和 verify，再启动。v0.2 内升级保留 `control/universe` 与未 ACK spool；只有明确执行 clean start
+和 verify，再启动。v0.3 内升级保留 `control/universe` 与未 ACK spool；只有明确执行 clean start
 才删除它们。

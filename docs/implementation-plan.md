@@ -1,4 +1,4 @@
-# v0.2 正式采集实施合同
+# v0.3 正式采集实施合同
 
 ## 本阶段目标
 
@@ -15,28 +15,42 @@ ACK，并把重计算提交给 Slurm。正式采集过程中不依赖 GitHub，�
 - `probe` 固定 5 个槽位，代表最新上市的合格永续合约；
 - 三个角色始终互斥，总数始终等于 60。
 
-Vultr 每天 `23:50 UTC` 连续请求一次 `exchangeInfo`、一次全市场 24h ticker，再请求第二次
-`exchangeInfo`。只有两次 `exchangeInfo` 都为 `TRADING` 的 USDT 保证金 USDT 报价永续合约
-才合格。原始响应、时间和 SHA-256 都保存在本地 decision evidence 中。
+新 generation 1 由 [14 日官方证据](bootstrap-liquidity-decision-2026-08-12.md) 冻结。首次
+启动必须用新的双重状态、14 日 Kline 和盘口证据验证已冻结的 50/5/5 全部仍通过角色硬门槛，
+并同时绑定离线 evidence hash 与实时 source hashes。任何成员失效或不再合格就拒绝写正式
+起点；瞬时盘口导致的合格成员内部排名变化不会擅自改写冻结名单。
+
+Vultr 每天 `23:50 UTC` 用两次 `exchangeInfo` 包围完整证据抓取。只有两次响应都为
+`TRADING` 的 USDT 保证金、USDT 报价永续合约才合格。历史流动性来自完整 UTC 日 Kline，
+当天未结束的 Kline 永不进入决策。首次抓 14 日，随后从已落盘证据增量追加刚结束的一日。
+当前可采集性由 5 次全市场 bookTicker 和稳健 Top200 与最新 100 并集的 3 次 depth 验证。
+原始内容、时间和 SHA-256 都写入 decision evidence 和 raw metadata。
 
 ## 自动轮换
 
 候选角色每天 `00:00 UTC` 生效：
 
-- 流动性使用最近 1 至 7 个完整日观测的 `quoteVolume` 均值；
+- core/boundary 使用最近 14 个完整 UTC 日；probe 上市后至少有 7/7 个完整 UTC 日；
+- 每日成交额要求中位数 `>=10M`、P25 `>=5M`、最小值 `>=3M USDT`、CV `<=1.2`；
+- 每日交易数要求中位数 `>=100K`、P25 `>=50K`、最小值 `>=25K`；
+- 5 次 bookTicker 与 3 次 depth 最大点差 `<=10 bps`，depth 较薄侧
+  `+/-10 bps >=800`、`+/-50 bps >=10K USDT`；
 - boundary 目标为非 core、非 probe 的 Top5，现有成员在 Top10 内可保留；
-- probe 优先最新上市的合格合约；
+- probe 在通过全部门槛的合约中优先最新上市者；
 - 正常情况下每天最多替换 2 个币，boundary 和 probe 各最多 1 个；
 - candidate 成员至少停留 48 小时；
 - 两次状态请求确认停止交易后，允许为恢复可采集性进行强制替换。
 
 core 只在周一 `00:00 UTC` 评估：
 
-- 至少 7 个完整日观测，合约年龄至少 30 天；
+- 14/14 个完整日，合约年龄至少 30 天；
 - 新成员必须进入 Top45；现有成员跌出 Top55 后才具备退出资格；
 - core 成员至少停留 14 天；
 - 每周最多替换 5 个 core；
 - 已被两次状态请求确认停止交易的 core 可优先替换。
+
+合格 stable 池少于 65 时报警。任何角色候选不足都 fail closed：保留当前采集、记录评估并
+报警，不自动放宽门槛、不产出少于 60 个成员的 decision。
 
 每次评估都写 evaluation。成员变化时写带 generation、角色、证据 hash、原因、
 `effective_at` 和 `universe_hash` 的 decision。`automation_enabled: false` 可暂停自动决策；
@@ -101,3 +115,14 @@ ticker 响应的 SHA-256。该事件时间之后的数据属于正式实验。24
 - 磁盘可用空间至少 5GiB。
 
 首次 24 小时只做观察和判定。任何硬指标失败都应扩容或优化实现，不得改变 60 币正式合同。
+
+## 数据层级边界
+
+v0.3 采集 `depth@100ms` 与 1,000 档 snapshot，用于可验证地重建 market-by-price L2；
+它不采集、也不声称能重建带全市场 resting order ID 和同价排队关系的 true L3。
+Binance 公开 USD-M 行情接口没有提供这种 market-by-order feed。可选 D0 的 individual trade
+和 RPI depth 也不构成 L3，正式配置保持 `d0_enabled: false`。
+
+当前实验研究价差、价位深度、冲击成本、成交与 L2 order-flow imbalance，不需要 L3。
+只有研究 queue position、逐订单寿命、撤单行为或订单级成交概率时，才另立第三方数据源与
+基础设施项目；容量和来源评估见 [L3 数据评估](l3-data-assessment-2026-08-12.md)。

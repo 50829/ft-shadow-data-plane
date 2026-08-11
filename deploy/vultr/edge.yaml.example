@@ -1,75 +1,92 @@
 collector_id: tokyo01
 data_root: /data
 universe:
-  experiment_id: formal-60-2026-08-12
+  experiment_id: formal-60-v2-2026-08-12
+  bootstrap_evidence_sha256: c77498c9be3ae0547c983db06d166ac9711945067aaa7ac4a7bf6623dbd65910
   core:
+    - 1000BONKUSDT
     - 1000PEPEUSDT
-    - ACEUSDT
-    - ACTUSDT
+    - 1000SHIBUSDT
+    - AAVEUSDT
     - ADAUSDT
+    - AKEUSDT
+    - ALLOUSDT
+    - ARBUSDT
     - AVAXUSDT
     - BANKUSDT
-    - BEATUSDT
-    - BICOUSDT
-    - BLESSUSDT
-    - BLUAIUSDT
-    - BMTUSDT
+    - BCHUSDT
     - BNBUSDT
-    - BOMEUSDT
     - BTCUSDT
-    - BTWUSDT
-    - COOKIEUSDT
-    - CYSUSDT
+    - COTIUSDT
+    - DEXEUSDT
     - DOGEUSDT
+    - DOTUSDT
     - ENAUSDT
-    - EPICUSDT
+    - ESPORTSUSDT
     - ETHUSDT
-    - GWEIUSDT
-    - HEIUSDT
+    - EULUSDT
+    - FARTCOINUSDT
+    - FETUSDT
+    - FILUSDT
+    - HBARUSDT
     - HYPEUSDT
-    - IOTXUSDT
+    - INJUSDT
     - KAITOUSDT
     - LINKUSDT
-    - MMTUSDT
-    - MUBARAKUSDT
+    - LITUSDT
+    - LTCUSDT
     - NEARUSDT
-    - NILUSDT
     - ONDOUSDT
     - ONUSDT
     - PAXGUSDT
     - PENGUUSDT
-    - PEOPLEUSDT
     - PUMPUSDT
-    - SKYAIUSDT
+    - RIFUSDT
     - SOLUSDT
     - SUIUSDT
     - TAOUSDT
-    - TSTUSDT
-    - TUTUSDT
+    - TRUMPUSDT
+    - TRXUSDT
+    - UBUSDT
     - UNIUSDT
-    - USUSDT
     - WLDUSDT
-    - XANUSDT
+    - XLMUSDT
     - XMRUSDT
     - XRPUSDT
     - ZECUSDT
   boundary:
-    - AAVEUSDT
-    - BANANAS31USDT
-    - ESPUSDT
-    - HOMEUSDT
-    - THEUSDT
+    - APTUSDT
+    - ETCUSDT
+    - LDOUSDT
+    - WLFIUSDT
+    - ZAMAUSDT
   probe:
     - CAPUSDT
-    - DATAIPUSDT
-    - GRAMUSDT
-    - GRVTUSDT
-    - OUSDT
+    - ESPUSDT
+    - REUSDT
+    - SLXUSDT
+    - XAUTUSDT
   automation_enabled: true
   discovery_hour_utc: 23
   discovery_minute_utc: 50
   decision_cutoff_minute_utc: 55
-  liquidity_window_days: 7
+  liquidity_window_days: 14
+  probe_minimum_complete_days: 7
+  minimum_median_daily_quote_volume: 10000000
+  minimum_q25_daily_quote_volume: 5000000
+  minimum_daily_quote_volume: 3000000
+  maximum_quote_volume_cv: 1.2
+  minimum_median_daily_trades: 100000
+  minimum_q25_daily_trades: 50000
+  minimum_daily_trades: 25000
+  liquidity_depth_samples: 3
+  liquidity_book_ticker_samples: 5
+  maximum_spread_bps: 10
+  minimum_thin_depth_10bps: 800
+  minimum_thin_depth_50bps: 10000
+  depth_stable_candidate_count: 200
+  depth_probe_candidate_count: 100
+  liquidity_request_interval_seconds: 0.25
   candidate_minimum_dwell_hours: 48
   core_minimum_dwell_days: 14
   candidate_daily_replacements: 2
@@ -78,6 +95,7 @@ universe:
   core_entry_rank: 45
   core_retain_rank: 55
   boundary_retain_rank: 10
+  stable_pool_warning_size: 65
 public_ws_url: wss://fstream.binance.com/public/stream
 market_ws_url: wss://fstream.binance.com/market/stream
 rest_url: https://fapi.binance.com

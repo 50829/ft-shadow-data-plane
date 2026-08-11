@@ -1,11 +1,11 @@
-# v0.2 端到端部署顺序
+# v0.3 端到端部署顺序
 
 正式链路必须按以下顺序上线，避免 collector 产生数据后没有可用的异地持久化端。
 
 1. 在 107 准备 `~/.ssh/ft-data-puller`，将公钥安全传给 Vultr 管理员；
 2. 在 Vultr 安装 `rsync`、`rrsync`、Docker 和 OpenSSH，运行 `deploy/vultr/install.sh`；
 3. Vultr 运行 `configure-rsync.sh` 安装 107 公钥，并独立核对 host-key 指纹；
-4. 在 107 安装 v0.2 SIF，安装器构建 hash-named writable sandbox；
+4. 在 107 安装 v0.3 SIF，安装器构建 hash-named writable sandbox；
 5. 107 配置 `central.yaml`，先用 `rsync --list-only` 和一次前台 pull 验证；
 6. 107 安装每分钟 cron，确认至少两个周期均成功；
 7. Vultr 写入 immutable image digest 和正式 60 币配置；

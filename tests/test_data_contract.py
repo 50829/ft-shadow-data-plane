@@ -13,6 +13,7 @@ def test_data_contract_tracks_d0_and_open_interest_configuration() -> None:
     d0 = orjson.loads(data_contract_v1(d0_enabled=True))
 
     assert default["d0_enabled"] is False
+    assert {"daily_klines", "liquidity_depth"} <= set(default["streams"])
     assert {"trade", "rpi_depth", "rpi_depth_snapshot"}.isdisjoint(default["streams"])
     assert {"trade", "rpi_depth", "rpi_depth_snapshot"} <= set(d0["streams"])
     assert data_contract_hash_v1(d0_enabled=True) != data_contract_hash_v1()

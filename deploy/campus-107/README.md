@@ -23,7 +23,7 @@ module -t avail 2>&1 | grep apptainer
 command -v crontab flock sbatch ssh
 ```
 
-需要 v0.2 的仓库目录、`ft-shadow-data-plane.sif`、对应 SHA-256 文件，以及 Vultr 已授权的
+需要 v0.3 的仓库目录、`ft-shadow-data-plane.sif`、对应 SHA-256 文件，以及 Vultr 已授权的
 `~/.ssh/ft-data-puller` 私钥。
 
 ## 2. clean start
@@ -56,7 +56,7 @@ rm -rf -- \
 mkdir -p /home/scc/pb24000367/Projects/bn/data
 ```
 
-## 3. 校验并安装 v0.2
+## 3. 校验并安装 v0.3
 
 ```bash
 cd /home/scc/pb24000367/Projects/bn/ft-shadow-data-plane
@@ -201,6 +201,6 @@ sacct -j <job-id> --format=JobID,State,Elapsed,MaxRSS,ExitCode
 - `rrsync` 拒绝命令：Vultr 仍有旧 SSH Match 配置，或客户端使用了服务端删除/覆盖参数；
 - `apptainer: command not found`：只使用绝对路径，不依赖 cron 中的 module；
 - overlay `invalid argument`：确认镜像是 `.sandbox` 且命令包含 `exec --writable`；
-- `pull-once.sh: Permission denied`：重新运行 v0.2 installer，并检查 `stat -c '%A' runtime/pull-once.sh`；
+- `pull-once.sh: Permission denied`：重新运行 v0.3 installer，并检查 `stat -c '%A' runtime/pull-once.sh`；
 - raw 不增长：先看 `pull.log`，再看 `runtime/rsync/ready` 是否有 manifest，最后在 Vultr 检查
   collector 是否仍写 `ready/`。
