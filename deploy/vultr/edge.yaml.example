@@ -99,7 +99,7 @@ universe:
 public_ws_url: wss://fstream.binance.com/public/stream
 market_ws_url: wss://fstream.binance.com/market/stream
 rest_url: https://fapi.binance.com
-public_connection_shards: 2
+public_connection_shards: 4
 connection_rotation_seconds: 82800
 connection_overlap_seconds: 15
 websocket_receive_timeout_seconds: 30

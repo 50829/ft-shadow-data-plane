@@ -133,7 +133,7 @@ class EdgeConfig(BaseModel):
     public_ws_url: str
     market_ws_url: str
     rest_url: str
-    public_connection_shards: int = Field(default=2, ge=1, le=4)
+    public_connection_shards: int = Field(default=4, ge=1, le=4)
     connection_rotation_seconds: int = Field(default=82_800, ge=3_600, le=86_000)
     connection_overlap_seconds: int = Field(default=15, ge=1, le=120)
     websocket_receive_timeout_seconds: float = Field(default=30.0, ge=5, le=300)

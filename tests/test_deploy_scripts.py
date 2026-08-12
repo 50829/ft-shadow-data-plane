@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from ft_shadow_data_plane.edge.binance import shard_instruments
 from ft_shadow_data_plane.edge.config import load_edge_config
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -47,7 +48,16 @@ def test_vultr_config_is_formal_sixty_and_memory_bounded() -> None:
         5,
     )
     assert len(config.universe.members) == 60
-    assert config.public_connection_shards == 2
+    assert config.public_connection_shards == 4
+    shard_sizes = sorted(
+        len(shard)
+        for shard in shard_instruments(
+            config.universe.members,
+            config.public_connection_shards,
+        )
+    )
+    assert shard_sizes == [14, 14, 14, 18]
+    assert (max(shard_sizes) - 1) * config.snapshot_request_interval_seconds <= 34
     assert config.queue_max_bytes == 64 * 1024**2
     assert config.websocket_max_queue == 4
     assert config.writer_batch_bytes == 2 * 1024**2

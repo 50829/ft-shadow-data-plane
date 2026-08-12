@@ -5,7 +5,7 @@ import gzip
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -43,6 +43,7 @@ class ConnectionHandle:
     ready: asyncio.Event
     stop: asyncio.Event
     task: asyncio.Task[None]
+    transport_ready: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class RouteRunner:
@@ -258,30 +259,56 @@ class RouteRunner:
         current: ConnectionHandle | None = None
         gap_id: str | None = None
         gap_reason = GapReason.CONNECTION_LOST
+        recovery_started_at: float | None = None
+        transport_recovered_at: float | None = None
         while not self._service_stop.is_set():
             if current is None:
                 try:
-                    current = await self._start_ready_connection()
-                    self._on_ready(self._name)
+                    on_transport_ready = None
                     if gap_id is not None:
-                        await self._gaps.close(
-                            gap_id,
-                            gap_reason,
-                            connection_id=current.identity.connection_id,
-                            exchange_symbols=self._instruments,
-                            stream_types=self._stream_types,
-                            detail=f"{self._name} recovered",
-                        )
+
+                        async def report_transport_ready(
+                            identity: SourceIdentity,
+                            recovery_reason: GapReason = gap_reason,
+                            started_at: float | None = recovery_started_at,
+                        ) -> None:
+                            nonlocal gap_id, transport_recovered_at
+                            if gap_id is None:
+                                return
+                            transport_recovered_at = await self._close_transport_gap(
+                                gap_id=gap_id,
+                                reason=recovery_reason,
+                                identity=identity,
+                                started_at=started_at,
+                            )
+                            gap_id = None
+
+                        on_transport_ready = report_transport_ready
+                    current = await self._start_ready_connection(
+                        on_transport_ready=on_transport_ready
+                    )
+                    self._on_ready(self._name)
+                    if transport_recovered_at is not None:
+                        now = time.monotonic()
                         logger.info(
-                            "connection recovered route=%s connection_id=%s gap_id=%s",
+                            "connection snapshot ready route=%s connection_id=%s "
+                            "reanchor_s=%.3f total_recovery_s=%.3f",
                             self._name,
                             current.identity.connection_id,
-                            gap_id,
+                            now - transport_recovered_at,
+                            (
+                                now - recovery_started_at
+                                if recovery_started_at is not None
+                                else 0.0
+                            ),
                         )
-                        gap_id = None
+                    recovery_started_at = None
+                    transport_recovered_at = None
                 except QueueOverloaded as exc:
-                    gap_reason = GapReason.INGEST_OVERLOAD
                     if gap_id is None:
+                        gap_reason = GapReason.INGEST_OVERLOAD
+                        recovery_started_at = time.monotonic()
+                        transport_recovered_at = None
                         gap_id = await self._open_gap(gap_reason, str(exc))
                     await self._queues.wait_until_resumable()
                     continue
@@ -289,8 +316,11 @@ class RouteRunner:
                     return
                 except (aiohttp.ClientError, ConnectionClosed, OSError, TimeoutError) as exc:
                     if gap_id is None:
+                        gap_reason = GapReason.CONNECTION_LOST
+                        recovery_started_at = time.monotonic()
+                        transport_recovered_at = None
                         gap_id = await self._open_gap(
-                            GapReason.CONNECTION_LOST,
+                            gap_reason,
                             str(exc),
                             affected_from_realtime_ns=_error_affected_from(exc),
                         )
@@ -308,6 +338,8 @@ class RouteRunner:
                     if isinstance(error, QueueOverloaded)
                     else GapReason.CONNECTION_LOST
                 )
+                recovery_started_at = time.monotonic()
+                transport_recovered_at = None
                 gap_id = await self._open_gap(
                     gap_reason,
                     str(error or "connection closed"),
@@ -352,7 +384,11 @@ class RouteRunner:
                 await self._wait_or_stop(30)
                 continue
 
-    async def _start_ready_connection(self) -> ConnectionHandle:
+    async def _start_ready_connection(
+        self,
+        *,
+        on_transport_ready: Callable[[SourceIdentity], Awaitable[None]] | None = None,
+    ) -> ConnectionHandle:
         connection_id = f"{self._name}-{uuid4().hex}"
         identity = SourceIdentity(
             collector_id=self._collector_id,
@@ -361,6 +397,7 @@ class RouteRunner:
             connection_id=connection_id,
         )
         ready = asyncio.Event()
+        transport_ready = asyncio.Event()
         stop = asyncio.Event()
         connection = BinanceWebSocketConnection(
             url=self._url,
@@ -382,31 +419,57 @@ class RouteRunner:
             on_event=self._mark_event,
             subscription_audit_seconds=self._subscription_audit_seconds,
             subscription_audit_timeout_seconds=self._subscription_audit_timeout_seconds,
+            transport_ready=transport_ready,
+            transport_ready_keys=tuple(
+                (stream_type, symbol)
+                for stream_type in self._liveness_stream_types
+                for symbol in self._instruments
+            ),
         )
         task = asyncio.create_task(connection.run(), name=connection_id)
-        handle = ConnectionHandle(identity, ready, stop, task)
+        handle = ConnectionHandle(identity, ready, stop, task, transport_ready)
         ready_task = asyncio.create_task(ready.wait())
+        transport_ready_task = asyncio.create_task(transport_ready.wait())
         service_stop_task = asyncio.create_task(self._service_stop.wait())
-        done, pending = await asyncio.wait(
-            (ready_task, task, service_stop_task),
-            timeout=600,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for pending_task in pending:
-            if pending_task is not task:
-                pending_task.cancel()
-        if service_stop_task in done and self._service_stop.is_set():
+        transport_reported = False
+        started_at = time.monotonic()
+        try:
+            while not (ready_task.done() and transport_reported):
+                remaining = 600 - (time.monotonic() - started_at)
+                if remaining <= 0:
+                    raise TimeoutError("websocket did not become fully ready within 600 seconds")
+                waiters: set[asyncio.Task[object]] = {task, service_stop_task}
+                if not ready_task.done():
+                    waiters.add(ready_task)
+                if not transport_reported:
+                    waiters.add(transport_ready_task)
+                done, _ = await asyncio.wait(
+                    waiters,
+                    timeout=remaining,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    raise TimeoutError("websocket did not become fully ready within 600 seconds")
+                if service_stop_task in done and self._service_stop.is_set():
+                    raise asyncio.CancelledError
+                if task in done:
+                    error = _task_error(task)
+                    if error is not None:
+                        raise error
+                    raise OSError("websocket closed before becoming ready")
+                if transport_ready_task in done and not transport_reported:
+                    if on_transport_ready is not None:
+                        await on_transport_ready(identity)
+                    transport_reported = True
+            return handle
+        except BaseException:
             await _stop_handle(handle)
-            raise asyncio.CancelledError
-        if task in done:
-            error = _task_error(task)
-            if error is not None:
-                raise error
-            raise OSError("websocket closed before becoming ready")
-        if ready_task not in done:
-            await _stop_handle(handle)
-            raise TimeoutError("websocket did not become snapshot-ready within 600 seconds")
-        return handle
+            raise
+        finally:
+            auxiliary_waiters = (ready_task, transport_ready_task, service_stop_task)
+            for waiter in auxiliary_waiters:
+                waiter.cancel()
+            await asyncio.gather(*auxiliary_waiters, return_exceptions=True)
 
     def _snapshot_requests(self) -> tuple[tuple[str, StreamType], ...]:
         return self._snapshot_requests_for(self._instruments)
@@ -486,6 +549,35 @@ class RouteRunner:
             affected_from_realtime_ns=affected_from_ns,
             detail=f"{self._name}: {detail}"[:500],
         )
+
+    async def _close_transport_gap(
+        self,
+        *,
+        gap_id: str,
+        reason: GapReason,
+        identity: SourceIdentity,
+        started_at: float | None,
+    ) -> float:
+        await self._gaps.close(
+            gap_id,
+            reason,
+            connection_id=identity.connection_id,
+            exchange_symbols=self._instruments,
+            stream_types=self._stream_types,
+            detail=(
+                f"{self._name} transport recovered; L2 remains invalid until snapshot bridge"
+            ),
+        )
+        recovered_at = time.monotonic()
+        elapsed = recovered_at - started_at if started_at is not None else 0.0
+        logger.info(
+            "connection transport recovered route=%s connection_id=%s gap_id=%s recovery_s=%.3f",
+            self._name,
+            identity.connection_id,
+            gap_id,
+            elapsed,
+        )
+        return recovered_at
 
     async def _wait_or_stop(self, seconds: float) -> None:
         try:

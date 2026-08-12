@@ -103,6 +103,74 @@ class MissingAuditResponseWebSocket:
             )
 
 
+class RecoveryWebSocket:
+    def __init__(self) -> None:
+        self.responses: asyncio.Queue[bytes] = asyncio.Queue()
+        self.waiting_for_depth = asyncio.Event()
+        self.release_depth = asyncio.Event()
+        self.depth_sent = False
+
+    async def __aenter__(self) -> RecoveryWebSocket:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+    async def send(self, value: str) -> None:
+        message = orjson.loads(value)
+        if message["method"] != "SUBSCRIBE":
+            return
+        await self.responses.put(orjson.dumps({"result": None, "id": message["id"]}))
+        await self.responses.put(
+            orjson.dumps(
+                {
+                    "stream": "btcusdt@bookTicker",
+                    "data": {"e": "bookTicker", "s": "BTCUSDT"},
+                }
+            )
+        )
+
+    async def recv(self, *, decode: bool) -> bytes:
+        assert decode is False
+        if not self.responses.empty():
+            return self.responses.get_nowait()
+        if self.depth_sent:
+            await asyncio.Future()
+            raise AssertionError("unreachable")
+        self.waiting_for_depth.set()
+        await self.release_depth.wait()
+        self.depth_sent = True
+        return orjson.dumps(
+            {
+                "stream": "btcusdt@depth@100ms",
+                "data": {
+                    "e": "depthUpdate",
+                    "s": "BTCUSDT",
+                    "U": 2,
+                    "u": 2,
+                    "pu": 1,
+                    "b": [],
+                    "a": [],
+                },
+            }
+        )
+
+
+class BlockingSnapshotRest:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def fetch_snapshot(
+        self, path: str, *, symbol: str
+    ) -> tuple[bytes, int, int, str]:
+        assert path == "/fapi/v1/depth"
+        assert symbol == "BTCUSDT"
+        self.started.set()
+        await self.release.wait()
+        return b'{"lastUpdateId":1,"bids":[],"asks":[]}', 1, 2, "snapshot"
+
+
 class RecordingIngest:
     def __init__(self) -> None:
         self.events: list[RawEventV1] = []
@@ -451,6 +519,66 @@ async def test_websocket_silence_fails_the_connection(monkeypatch: pytest.Monkey
         with pytest.raises(TimeoutError, match="no websocket message"):
             await task
     finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_transport_recovers_before_l2_snapshots_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    websocket = RecoveryWebSocket()
+    rest = BlockingSnapshotRest()
+    snapshot_ready = asyncio.Event()
+    transport_ready = asyncio.Event()
+    stop = asyncio.Event()
+    monkeypatch.setattr(
+        "ft_shadow_data_plane.edge.binance.connect",
+        lambda *args, **kwargs: websocket,
+    )
+
+    async def open_depth_gap(*args: object) -> str:
+        return "gap-depth"
+
+    async def close_depth_gap(*args: object) -> None:
+        return None
+
+    connection = BinanceWebSocketConnection(
+        url="wss://example.invalid/stream",
+        subscriptions=("btcusdt@bookTicker", "btcusdt@depth@100ms"),
+        identity=SourceIdentity("tokyo01", "boot", "segment", "connection"),
+        ingest=RecordingIngest(),  # type: ignore[arg-type]
+        snapshot_requests=(("BTCUSDT", StreamType.DEPTH_SNAPSHOT),),
+        rest=rest,  # type: ignore[arg-type]
+        ready=snapshot_ready,
+        transport_ready=transport_ready,
+        transport_ready_keys=(
+            (StreamType.BOOK_TICKER, "BTCUSDT"),
+            (StreamType.DEPTH, "BTCUSDT"),
+        ),
+        stop=stop,
+        receive_timeout_seconds=1,
+        ping_interval_seconds=20,
+        ping_timeout_seconds=20,
+        max_queue=4,
+        max_message_bytes=2 * 1024**2,
+        updates=asyncio.Queue(),
+        on_depth_gap=open_depth_gap,
+        on_depth_reanchored=close_depth_gap,
+    )
+
+    task = asyncio.create_task(connection.run())
+    try:
+        await asyncio.wait_for(rest.started.wait(), timeout=0.5)
+        await asyncio.wait_for(websocket.waiting_for_depth.wait(), timeout=0.5)
+        assert not transport_ready.is_set()
+        websocket.release_depth.set()
+        await asyncio.wait_for(transport_ready.wait(), timeout=0.5)
+        assert not snapshot_ready.is_set()
+        rest.release.set()
+        await asyncio.wait_for(snapshot_ready.wait(), timeout=0.5)
+    finally:
+        stop.set()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 

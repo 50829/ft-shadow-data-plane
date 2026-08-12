@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import gzip
 from collections import Counter
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -138,6 +139,38 @@ class RouteGaps:
     ) -> str:
         self.opened.append((reason, connection_id))
         return "gap-connection"
+
+    async def close(
+        self,
+        gap_id: str,
+        reason: GapReason,
+        *,
+        connection_id: str | None = None,
+        exchange_symbols: tuple[str, ...],
+        stream_types: tuple[StreamType, ...],
+        detail: str,
+    ) -> None:
+        self.closed.append((gap_id, reason, connection_id))
+
+
+class SequencedRouteGaps:
+    def __init__(self) -> None:
+        self.opened: list[tuple[str, GapReason, str | None]] = []
+        self.closed: list[tuple[str, GapReason, str | None]] = []
+
+    async def open(
+        self,
+        reason: GapReason,
+        *,
+        connection_id: str | None = None,
+        exchange_symbols: tuple[str, ...],
+        stream_types: tuple[StreamType, ...],
+        affected_from_realtime_ns: int | None = None,
+        detail: str,
+    ) -> str:
+        gap_id = f"gap-{len(self.opened) + 1}"
+        self.opened.append((gap_id, reason, connection_id))
+        return gap_id
 
     async def close(
         self,
@@ -433,7 +466,10 @@ async def test_route_timeout_opens_gap_and_recovery_closes_it(
     async def wait_until_cancelled() -> None:
         await asyncio.Event().wait()
 
-    async def start_connection() -> ConnectionHandle:
+    async def start_connection(
+        *,
+        on_transport_ready: Callable[[SourceIdentity], Awaitable[None]] | None = None,
+    ) -> ConnectionHandle:
         nonlocal starts
         starts += 1
         identity = SourceIdentity("tokyo01", "boot", f"segment-{starts}", f"connection-{starts}")
@@ -441,6 +477,8 @@ async def test_route_timeout_opens_gap_and_recovery_closes_it(
             task = asyncio.create_task(fail_silently())
         else:
             task = asyncio.create_task(wait_until_cancelled())
+            if on_transport_ready is not None:
+                await on_transport_ready(identity)
             asyncio.get_running_loop().call_soon(stop.set)
         return ConnectionHandle(identity, asyncio.Event(), asyncio.Event(), task)
 
@@ -454,3 +492,156 @@ async def test_route_timeout_opens_gap_and_recovery_closes_it(
 
     assert gaps.opened == [(GapReason.CONNECTION_LOST, "connection-1")]
     assert gaps.closed == [("gap-connection", GapReason.CONNECTION_LOST, "connection-2")]
+
+
+@pytest.mark.asyncio
+async def test_route_reports_transport_recovery_before_snapshots_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop = asyncio.Event()
+    snapshot_release = asyncio.Event()
+    transport_recovered = asyncio.Event()
+    observed_keys: set[tuple[StreamType, str]] = set()
+
+    class ControlledConnection:
+        def __init__(self, **kwargs: object) -> None:
+            self.ready = kwargs["ready"]
+            self.transport_ready = kwargs["transport_ready"]
+            self.stop = kwargs["stop"]
+            observed_keys.update(kwargs["transport_ready_keys"])  # type: ignore[arg-type]
+
+        async def run(self) -> None:
+            self.transport_ready.set()  # type: ignore[union-attr]
+            await snapshot_release.wait()
+            self.ready.set()  # type: ignore[union-attr]
+            await self.stop.wait()  # type: ignore[union-attr]
+
+    monkeypatch.setattr(
+        "ft_shadow_data_plane.edge.sources.BinanceWebSocketConnection",
+        ControlledConnection,
+    )
+    runner = RouteRunner(
+        name="public-0",
+        url="wss://example.invalid/stream",
+        subscriptions=("btcusdt@bookTicker", "btcusdt@depth@100ms"),
+        instruments=("BTCUSDT",),
+        stream_types=(StreamType.BOOK_TICKER, StreamType.DEPTH),
+        collector_id="tokyo01",
+        boot_id="boot",
+        ingest=SimpleNamespace(),  # type: ignore[arg-type]
+        queues=FakeQueues(),  # type: ignore[arg-type]
+        gaps=SimpleNamespace(),  # type: ignore[arg-type]
+        rest=SimpleNamespace(),  # type: ignore[arg-type]
+        rotation_seconds=82_800,
+        overlap_seconds=15,
+        receive_timeout_seconds=30,
+        ping_interval_seconds=20,
+        ping_timeout_seconds=20,
+        service_stop=stop,
+        liveness_timeout_seconds=30,
+        liveness_stream_types=(StreamType.BOOK_TICKER, StreamType.DEPTH),
+    )
+
+    async def report_transport_recovery(identity: SourceIdentity) -> None:
+        assert identity.connection_id.startswith("public-0-")
+        transport_recovered.set()
+
+    starting = asyncio.create_task(
+        runner._start_ready_connection(on_transport_ready=report_transport_recovery)
+    )
+    handle: ConnectionHandle | None = None
+    try:
+        await asyncio.wait_for(transport_recovered.wait(), timeout=0.5)
+        assert not starting.done()
+        assert observed_keys == {
+            (StreamType.BOOK_TICKER, "BTCUSDT"),
+            (StreamType.DEPTH, "BTCUSDT"),
+        }
+        snapshot_release.set()
+        handle = await asyncio.wait_for(starting, timeout=0.5)
+    finally:
+        stop.set()
+        snapshot_release.set()
+        if not starting.done():
+            starting.cancel()
+        await asyncio.gather(starting, return_exceptions=True)
+    assert handle is not None
+    handle.stop.set()
+    await asyncio.wait_for(handle.task, timeout=0.5)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_failure_after_transport_recovery_opens_a_new_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop = asyncio.Event()
+    gaps = SequencedRouteGaps()
+    runner = RouteRunner(
+        name="public-0",
+        url="wss://example.invalid/stream",
+        subscriptions=("btcusdt@bookTicker", "btcusdt@depth@100ms"),
+        instruments=("BTCUSDT",),
+        stream_types=(StreamType.BOOK_TICKER, StreamType.DEPTH),
+        collector_id="tokyo01",
+        boot_id="boot",
+        ingest=SimpleNamespace(),  # type: ignore[arg-type]
+        queues=FakeQueues(),  # type: ignore[arg-type]
+        gaps=gaps,  # type: ignore[arg-type]
+        rest=SimpleNamespace(),  # type: ignore[arg-type]
+        rotation_seconds=82_800,
+        overlap_seconds=15,
+        receive_timeout_seconds=30,
+        ping_interval_seconds=20,
+        ping_timeout_seconds=20,
+        service_stop=stop,
+    )
+    starts = 0
+
+    async def fail_connection() -> None:
+        raise OSError("abrupt close")
+
+    async def wait_for_stop() -> None:
+        await stop.wait()
+
+    async def start_connection(
+        *,
+        on_transport_ready: Callable[[SourceIdentity], Awaitable[None]] | None = None,
+    ) -> ConnectionHandle:
+        nonlocal starts
+        starts += 1
+        identity = SourceIdentity("tokyo01", "boot", f"segment-{starts}", f"connection-{starts}")
+        if starts == 1:
+            return ConnectionHandle(
+                identity,
+                asyncio.Event(),
+                asyncio.Event(),
+                asyncio.create_task(fail_connection()),
+            )
+        assert on_transport_ready is not None
+        await on_transport_ready(identity)
+        if starts == 2:
+            raise OSError("snapshot failed after transport recovery")
+        asyncio.get_running_loop().call_soon(stop.set)
+        return ConnectionHandle(
+            identity,
+            asyncio.Event(),
+            asyncio.Event(),
+            asyncio.create_task(wait_for_stop()),
+        )
+
+    async def skip_retry_delay(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(runner, "_start_ready_connection", start_connection)
+    monkeypatch.setattr(runner, "_wait_or_stop", skip_retry_delay)
+
+    await asyncio.wait_for(runner.run(), timeout=0.5)
+
+    assert gaps.opened == [
+        ("gap-1", GapReason.CONNECTION_LOST, "connection-1"),
+        ("gap-2", GapReason.CONNECTION_LOST, None),
+    ]
+    assert gaps.closed == [
+        ("gap-1", GapReason.CONNECTION_LOST, "connection-2"),
+        ("gap-2", GapReason.CONNECTION_LOST, "connection-3"),
+    ]

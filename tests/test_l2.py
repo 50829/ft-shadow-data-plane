@@ -364,6 +364,40 @@ def test_transport_gap_on_same_connection_reopens_after_snapshot_bridge(tmp_path
     assert validity[1]["valid_from_ns"] == start_ns + 550
 
 
+def test_transport_recovery_does_not_restore_validity_before_snapshot_bridge(
+    tmp_path: Path,
+) -> None:
+    utc_date = date(2026, 8, 10)
+    start_ns = _midnight_ns(utc_date)
+    _write_typed_day(
+        tmp_path,
+        utc_date,
+        [
+            _typed_snapshot("old", 1, start_ns + 100, 100),
+            _typed_depth("old", 2, start_ns + 200, 100, 101, 99),
+            _typed_depth("new", 1, start_ns + 400, 102, 102, 101),
+            _typed_snapshot("new", 2, start_ns + 500, 102),
+            _typed_depth("new", 3, start_ns + 600, 102, 103, 101),
+        ],
+    )
+    _write_gap(tmp_path, utc_date, state="OPEN", observed_ns=start_ns + 300)
+    _write_gap(tmp_path, utc_date, state="CLOSED", observed_ns=start_ns + 350)
+
+    _, intervals = L2DayReconstructor(
+        derived_root=tmp_path,
+        collector_id="tokyo01",
+        utc_date=utc_date,
+        exchange_symbol="BTCUSDT",
+    ).run()
+
+    assert intervals == 2
+    validity = _read_json_lines(
+        tmp_path / "quality/collector=tokyo01/date=2026-08-10/symbol=BTCUSDT/l2-validity.jsonl"
+    )
+    assert validity[0]["valid_to_ns"] == start_ns + 300
+    assert validity[1]["valid_from_ns"] == start_ns + 500
+
+
 def test_liveness_gap_invalidates_from_last_proven_event_not_detection(tmp_path: Path) -> None:
     utc_date = date(2026, 8, 10)
     start_ns = _midnight_ns(utc_date)
