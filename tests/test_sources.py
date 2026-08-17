@@ -325,9 +325,143 @@ async def test_live_update_only_changes_replaced_symbol_subscriptions() -> None:
         "newusdt@depth@100ms",
     }
     assert update.snapshot_requests == (("NEWUSDT", StreamType.DEPTH_SNAPSHOT),)
+    update.acknowledged.set_result(None)
     update.completion.set_result(None)
     await updating
     assert runner.instruments == proposed
+
+
+@pytest.mark.asyncio
+async def test_targeted_refresh_only_changes_stale_public_streams() -> None:
+    runner = RouteRunner(
+        name="public-0",
+        url="wss://example.invalid/stream",
+        subscriptions=(
+            "btcusdt@bookTicker",
+            "btcusdt@depth@100ms",
+            "ethusdt@bookTicker",
+            "ethusdt@depth@100ms",
+        ),
+        instruments=("BTCUSDT", "ETHUSDT"),
+        stream_types=(StreamType.BOOK_TICKER, StreamType.DEPTH),
+        collector_id="tokyo01",
+        boot_id="boot",
+        ingest=SimpleNamespace(),  # type: ignore[arg-type]
+        queues=FakeQueues(),  # type: ignore[arg-type]
+        gaps=SimpleNamespace(),  # type: ignore[arg-type]
+        rest=SimpleNamespace(),  # type: ignore[arg-type]
+        rotation_seconds=82_800,
+        overlap_seconds=15,
+        receive_timeout_seconds=30,
+        ping_interval_seconds=20,
+        ping_timeout_seconds=20,
+        service_stop=asyncio.Event(),
+        subscriptions_for=lambda values: public_subscriptions(values, d0_enabled=False),
+    )
+
+    refreshing = asyncio.create_task(
+        runner._refresh_keys(
+            (
+                (StreamType.DEPTH, "BTCUSDT"),
+                (StreamType.BOOK_TICKER, "ETHUSDT"),
+            )
+        )
+    )
+    update = await asyncio.wait_for(runner._updates.get(), timeout=0.5)
+
+    assert update.remove == ("btcusdt@depth@100ms", "ethusdt@bookTicker")
+    assert update.add == update.remove
+    assert update.snapshot_requests == (("BTCUSDT", StreamType.DEPTH_SNAPSHOT),)
+    update.acknowledged.set_result(None)
+    update.completion.set_result(None)
+    await refreshing
+
+
+@pytest.mark.asyncio
+async def test_targeted_mark_price_refresh_does_not_touch_trade_streams() -> None:
+    runner = RouteRunner(
+        name="market-0",
+        url="wss://example.invalid/stream",
+        subscriptions=(
+            "btcusdt@aggTrade",
+            "btcusdt@markPrice@1s",
+            "btcusdt@forceOrder",
+            "!contractInfo",
+        ),
+        instruments=("BTCUSDT",),
+        stream_types=(
+            StreamType.AGG_TRADE,
+            StreamType.MARK_PRICE,
+            StreamType.FORCE_ORDER,
+            StreamType.CONTRACT_INFO,
+        ),
+        collector_id="tokyo01",
+        boot_id="boot",
+        ingest=SimpleNamespace(),  # type: ignore[arg-type]
+        queues=FakeQueues(),  # type: ignore[arg-type]
+        gaps=SimpleNamespace(),  # type: ignore[arg-type]
+        rest=SimpleNamespace(),  # type: ignore[arg-type]
+        rotation_seconds=82_800,
+        overlap_seconds=15,
+        receive_timeout_seconds=30,
+        ping_interval_seconds=20,
+        ping_timeout_seconds=20,
+        service_stop=asyncio.Event(),
+        subscriptions_for=lambda values: tuple(
+            f"{symbol.lower()}@markPrice@1s" for symbol in values
+        ),
+    )
+
+    refreshing = asyncio.create_task(
+        runner._refresh_keys(((StreamType.MARK_PRICE, "BTCUSDT"),))
+    )
+    update = await asyncio.wait_for(runner._updates.get(), timeout=0.5)
+
+    assert update.remove == ("btcusdt@markPrice@1s",)
+    assert update.add == update.remove
+    assert update.snapshot_requests == ()
+    update.acknowledged.set_result(None)
+    update.completion.set_result(None)
+    await refreshing
+
+
+@pytest.mark.asyncio
+async def test_subscription_ack_deadline_is_separate_from_snapshot_completion() -> None:
+    runner = RouteRunner(
+        name="public-0",
+        url="wss://example.invalid/stream",
+        subscriptions=("btcusdt@depth@100ms",),
+        instruments=("BTCUSDT",),
+        stream_types=(StreamType.DEPTH,),
+        collector_id="tokyo01",
+        boot_id="boot",
+        ingest=SimpleNamespace(),  # type: ignore[arg-type]
+        queues=FakeQueues(),  # type: ignore[arg-type]
+        gaps=SimpleNamespace(),  # type: ignore[arg-type]
+        rest=SimpleNamespace(),  # type: ignore[arg-type]
+        rotation_seconds=82_800,
+        overlap_seconds=15,
+        receive_timeout_seconds=30,
+        ping_interval_seconds=20,
+        ping_timeout_seconds=20,
+        service_stop=asyncio.Event(),
+        subscriptions_for=lambda values: tuple(
+            f"{symbol.lower()}@depth@100ms" for symbol in values
+        ),
+        subscription_audit_timeout_seconds=0.01,
+    )
+
+    refreshing = asyncio.create_task(
+        runner._refresh_keys(((StreamType.DEPTH, "BTCUSDT"),))
+    )
+    update = await asyncio.wait_for(runner._updates.get(), timeout=0.5)
+    update.acknowledged.set_result(None)
+
+    await asyncio.sleep(0.02)
+    assert not refreshing.done(), "snapshot completion inherited the control ACK deadline"
+
+    update.completion.set_result(None)
+    await refreshing
 
 
 @pytest.mark.asyncio
@@ -371,12 +505,12 @@ async def test_liveness_detects_depth_silence_while_book_ticker_continues(
         else:
             stop.set()
 
-    async def refresh(symbols: tuple[str, ...]) -> None:
-        assert symbols == ("BTCUSDT",)
+    async def refresh(keys: tuple[tuple[StreamType, str], ...]) -> None:
+        assert keys == ((StreamType.DEPTH, "BTCUSDT"),)
         stop.set()
 
     monkeypatch.setattr(runner, "_wait_or_stop", advance_clock)
-    monkeypatch.setattr(runner, "_refresh_symbols", refresh)
+    monkeypatch.setattr(runner, "_refresh_keys", refresh)
 
     await asyncio.wait_for(runner.liveness_loop(), timeout=0.5)
 
@@ -414,22 +548,104 @@ async def test_liveness_gap_stays_open_until_the_stream_proves_recovery(
         liveness_stream_types=(StreamType.MARK_PRICE,),
     )
 
-    async def make_stale(_seconds: float) -> None:
-        runner._last_event[(StreamType.MARK_PRICE, "BTCUSDT")] = (
-            runner._last_event[(StreamType.MARK_PRICE, "BTCUSDT")][0] - 1,
-            1,
-        )
+    waits = 0
 
-    async def refresh_without_event(_symbols: tuple[str, ...]) -> None:
+    async def recover_then_stop(_seconds: float) -> None:
+        nonlocal waits
+        waits += 1
+        if waits == 1:
+            runner._last_event[(StreamType.MARK_PRICE, "BTCUSDT")] = (
+                runner._last_event[(StreamType.MARK_PRICE, "BTCUSDT")][0] - 1,
+                1,
+            )
+        elif waits == 2:
+            runner._mark_event(StreamType.MARK_PRICE, "BTCUSDT")
+        else:
+            stop.set()
+
+    async def refresh_without_event(_keys: tuple[tuple[StreamType, str], ...]) -> None:
         return None
 
-    monkeypatch.setattr(runner, "_wait_or_stop", make_stale)
-    monkeypatch.setattr(runner, "_refresh_symbols", refresh_without_event)
+    async def no_fresh_event(*_args: object, **_kwargs: object) -> None:
+        raise TimeoutError("stream remained silent")
 
-    with pytest.raises(TimeoutError):
-        await asyncio.wait_for(runner.liveness_loop(), timeout=0.5)
+    monkeypatch.setattr(runner, "_wait_or_stop", recover_then_stop)
+    monkeypatch.setattr(runner, "_refresh_keys", refresh_without_event)
+    monkeypatch.setattr(runner, "_wait_for_fresh_events", no_fresh_event)
+
+    await asyncio.wait_for(runner.liveness_loop(), timeout=0.5)
 
     assert gaps.opened == [(GapReason.CONNECTION_LOST, ("BTCUSDT",), (StreamType.MARK_PRICE,))]
+    assert gaps.closed == [
+        (
+            "gap-ethusdt",
+            GapReason.CONNECTION_LOST,
+            ("BTCUSDT",),
+            (StreamType.MARK_PRICE,),
+        )
+    ]
+    assert runner._reconnect_requested.is_set()
+
+
+@pytest.mark.asyncio
+async def test_liveness_refresh_timeout_keeps_route_monitor_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    stop = asyncio.Event()
+    gaps = FakeGaps()
+    monkeypatch.setattr("ft_shadow_data_plane.edge.sources.time.monotonic", lambda: clock[0])
+    runner = RouteRunner(
+        name="market-0",
+        url="wss://example.invalid/stream",
+        subscriptions=("btcusdt@markPrice@1s",),
+        instruments=("BTCUSDT",),
+        stream_types=(StreamType.MARK_PRICE,),
+        collector_id="tokyo01",
+        boot_id="boot",
+        ingest=SimpleNamespace(),  # type: ignore[arg-type]
+        queues=FakeQueues(),  # type: ignore[arg-type]
+        gaps=gaps,  # type: ignore[arg-type]
+        rest=SimpleNamespace(),  # type: ignore[arg-type]
+        rotation_seconds=82_800,
+        overlap_seconds=15,
+        receive_timeout_seconds=30,
+        ping_interval_seconds=20,
+        ping_timeout_seconds=20,
+        service_stop=stop,
+        subscriptions_for=lambda values: tuple(
+            f"{symbol.lower()}@markPrice@1s" for symbol in values
+        ),
+        liveness_timeout_seconds=5,
+        liveness_stream_types=(StreamType.MARK_PRICE,),
+    )
+
+    waits = 0
+    refreshes = 0
+
+    async def advance_then_stop(_seconds: float) -> None:
+        nonlocal waits
+        waits += 1
+        if waits == 1:
+            clock[0] = 6.0
+        elif waits == 3:
+            stop.set()
+
+    async def timeout_refresh(_keys: tuple[tuple[StreamType, str], ...]) -> None:
+        nonlocal refreshes
+        refreshes += 1
+        raise TimeoutError("targeted refresh timed out")
+
+    monkeypatch.setattr(runner, "_wait_or_stop", advance_then_stop)
+    monkeypatch.setattr(runner, "_refresh_keys", timeout_refresh)
+
+    await asyncio.wait_for(runner.liveness_loop(), timeout=0.5)
+
+    assert waits == 3
+    assert refreshes == 2
+    assert gaps.opened == [
+        (GapReason.CONNECTION_LOST, ("BTCUSDT",), (StreamType.MARK_PRICE,))
+    ]
     assert gaps.closed == []
 
 
@@ -490,6 +706,71 @@ async def test_route_timeout_opens_gap_and_recovery_closes_it(
 
     await asyncio.wait_for(runner.run(), timeout=0.5)
 
+    assert gaps.opened == [(GapReason.CONNECTION_LOST, "connection-1")]
+    assert gaps.closed == [("gap-connection", GapReason.CONNECTION_LOST, "connection-2")]
+
+
+@pytest.mark.asyncio
+async def test_targeted_recovery_failure_reconnects_only_the_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop = asyncio.Event()
+    gaps = RouteGaps()
+    runner = RouteRunner(
+        name="market-0",
+        url="wss://example.invalid/stream",
+        subscriptions=("btcusdt@markPrice@1s",),
+        instruments=("BTCUSDT",),
+        stream_types=(StreamType.MARK_PRICE,),
+        collector_id="tokyo01",
+        boot_id="boot",
+        ingest=SimpleNamespace(),  # type: ignore[arg-type]
+        queues=FakeQueues(),  # type: ignore[arg-type]
+        gaps=gaps,  # type: ignore[arg-type]
+        rest=SimpleNamespace(),  # type: ignore[arg-type]
+        rotation_seconds=82_800,
+        overlap_seconds=15,
+        receive_timeout_seconds=30,
+        ping_interval_seconds=20,
+        ping_timeout_seconds=20,
+        service_stop=stop,
+    )
+    starts = 0
+
+    async def wait_for_stop() -> None:
+        await stop.wait()
+
+    async def wait_until_cancelled() -> None:
+        await asyncio.Event().wait()
+
+    async def start_connection(
+        *,
+        on_transport_ready: Callable[[SourceIdentity], Awaitable[None]] | None = None,
+    ) -> ConnectionHandle:
+        nonlocal starts
+        starts += 1
+        identity = SourceIdentity(
+            "tokyo01", "boot", f"segment-{starts}", f"connection-{starts}"
+        )
+        if starts == 1:
+            asyncio.get_running_loop().call_soon(runner._reconnect_requested.set)
+            task = asyncio.create_task(wait_until_cancelled())
+        else:
+            assert on_transport_ready is not None
+            await on_transport_ready(identity)
+            asyncio.get_running_loop().call_soon(stop.set)
+            task = asyncio.create_task(wait_for_stop())
+        return ConnectionHandle(identity, asyncio.Event(), asyncio.Event(), task)
+
+    async def skip_retry_delay(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(runner, "_start_ready_connection", start_connection)
+    monkeypatch.setattr(runner, "_wait_or_stop", skip_retry_delay)
+
+    await asyncio.wait_for(runner.run(), timeout=0.5)
+
+    assert starts == 2
     assert gaps.opened == [(GapReason.CONNECTION_LOST, "connection-1")]
     assert gaps.closed == [("gap-connection", GapReason.CONNECTION_LOST, "connection-2")]
 

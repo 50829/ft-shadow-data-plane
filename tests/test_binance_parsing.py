@@ -12,6 +12,7 @@ from ft_shadow_data_plane.edge.binance import (
     BinanceWebSocketConnection,
     SourceIdentity,
     SubscriptionAuditError,
+    SubscriptionUpdate,
     decode_websocket,
 )
 
@@ -21,6 +22,7 @@ class StalledWebSocket:
         self.subscription_id: int | None = None
         self.receive_calls = 0
         self.stalled = asyncio.Event()
+        self.sent_methods: list[str] = []
 
     async def __aenter__(self) -> StalledWebSocket:
         return self
@@ -30,6 +32,7 @@ class StalledWebSocket:
 
     async def send(self, value: str) -> None:
         message = orjson.loads(value)
+        self.sent_methods.append(str(message["method"]))
         self.subscription_id = int(message["id"])
 
     async def recv(self, *, decode: bool) -> bytes:
@@ -518,6 +521,65 @@ async def test_websocket_silence_fails_the_connection(monkeypatch: pytest.Monkey
         assert task.done(), "a silent websocket remained stuck in recv()"
         with pytest.raises(TimeoutError, match="no websocket message"):
             await task
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_reconnected_websocket_ignores_expired_subscription_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    websocket = StalledWebSocket()
+    monkeypatch.setattr(
+        "ft_shadow_data_plane.edge.binance.connect",
+        lambda *args, **kwargs: websocket,
+    )
+    loop = asyncio.get_running_loop()
+    acknowledged = loop.create_future()
+    completion = loop.create_future()
+    acknowledged.cancel()
+    completion.cancel()
+    updates: asyncio.Queue[SubscriptionUpdate] = asyncio.Queue()
+    updates.put_nowait(
+        SubscriptionUpdate(
+            add=("ethusdt@markPrice@1s",),
+            remove=("btcusdt@markPrice@1s",),
+            snapshot_requests=(),
+            acknowledged=acknowledged,
+            completion=completion,
+        )
+    )
+
+    async def open_depth_gap(*args: object) -> str:
+        return "gap-depth"
+
+    async def close_depth_gap(*args: object) -> None:
+        return None
+
+    connection = BinanceWebSocketConnection(
+        url="wss://example.invalid/stream",
+        subscriptions=("btcusdt@markPrice@1s",),
+        identity=SourceIdentity("tokyo01", "boot", "segment", "connection"),
+        ingest=RecordingIngest(),  # type: ignore[arg-type]
+        snapshot_requests=(),
+        rest=SimpleNamespace(),  # type: ignore[arg-type]
+        ready=asyncio.Event(),
+        stop=asyncio.Event(),
+        receive_timeout_seconds=1,
+        ping_interval_seconds=20,
+        ping_timeout_seconds=20,
+        max_queue=4,
+        max_message_bytes=2 * 1024**2,
+        updates=updates,
+        on_depth_gap=open_depth_gap,
+        on_depth_reanchored=close_depth_gap,
+    )
+
+    task = asyncio.create_task(connection.run())
+    try:
+        await asyncio.wait_for(websocket.stalled.wait(), timeout=0.5)
+        assert websocket.sent_methods == ["SUBSCRIBE"]
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)

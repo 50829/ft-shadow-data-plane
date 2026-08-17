@@ -101,6 +101,7 @@ class RouteRunner:
         self._subscriptions_for = subscriptions_for
         self._updates: asyncio.Queue[SubscriptionUpdate] = asyncio.Queue(maxsize=1)
         self._update_lock = asyncio.Lock()
+        self._reconnect_requested = asyncio.Event()
         self._liveness_timeout_seconds = liveness_timeout_seconds
         self._liveness_stream_types = (
             tuple(dict.fromkeys(liveness_stream_types or stream_types))
@@ -133,16 +134,11 @@ class RouteRunner:
             added = tuple(sorted(proposed - previous))
             old_subscriptions = set(self._subscriptions)
             new_subscriptions = self._subscriptions_for(instruments)
-            completion = asyncio.get_running_loop().create_future()
-            await self._updates.put(
-                SubscriptionUpdate(
-                    add=tuple(sorted(set(new_subscriptions) - old_subscriptions)),
-                    remove=tuple(sorted(old_subscriptions - set(new_subscriptions))),
-                    snapshot_requests=self._snapshot_requests_for(added),
-                    completion=completion,
-                )
+            await self._submit_update(
+                add=tuple(sorted(set(new_subscriptions) - old_subscriptions)),
+                remove=tuple(sorted(old_subscriptions - set(new_subscriptions))),
+                snapshot_requests=self._snapshot_requests_for(added),
             )
-            await asyncio.wait_for(completion, timeout=180)
             self._subscriptions = new_subscriptions
             self._instruments = instruments
             now = time.monotonic()
@@ -160,11 +156,29 @@ class RouteRunner:
         if timeout is None:
             await self._service_stop.wait()
             return
+        active_gaps: dict[tuple[StreamType, str], tuple[str, float]] = {}
         while not self._service_stop.is_set():
             await self._wait_or_stop(max(1.0, timeout / 2))
             if self._service_stop.is_set():
                 return
             now = time.monotonic()
+            for key, (gap_id, opened_after) in tuple(active_gaps.items()):
+                observed = self._last_event.get(key)
+                if observed is not None and observed[0] <= opened_after:
+                    continue
+                stream_type, symbol = key
+                await self._gaps.close(
+                    gap_id,
+                    GapReason.CONNECTION_LOST,
+                    exchange_symbols=(symbol,),
+                    stream_types=(stream_type,),
+                    detail=(
+                        "stream activity resumed after targeted recovery"
+                        if observed is not None
+                        else "stream removed from the active route"
+                    ),
+                )
+                del active_gaps[key]
             stale = tuple(
                 (stream_type, symbol, observed_realtime_ns)
                 for (stream_type, symbol), (
@@ -175,14 +189,16 @@ class RouteRunner:
             )
             if not stale:
                 continue
-            stale_symbols = tuple(sorted({symbol for _stream_type, symbol, _realtime_ns in stale}))
+            stale_keys = tuple((stream_type, symbol) for stream_type, symbol, _ in stale)
             logger.warning(
                 "targeted subscription refresh route=%s stale=%s",
                 self._name,
                 [(stream.value, symbol) for stream, symbol, _realtime_ns in stale],
             )
-            opened = []
             for stream_type, symbol, affected_from_ns in stale:
+                key = (stream_type, symbol)
+                if key in active_gaps:
+                    continue
                 gap_id = await self._gaps.open(
                     GapReason.CONNECTION_LOST,
                     exchange_symbols=(symbol,),
@@ -190,9 +206,9 @@ class RouteRunner:
                     affected_from_realtime_ns=affected_from_ns,
                     detail=(f"{self._name}: no {stream_type.value} event for {timeout:g}s"),
                 )
-                opened.append((gap_id, stream_type, symbol))
+                active_gaps[key] = (gap_id, self._last_event[key][0])
             try:
-                await self._refresh_symbols(stale_symbols)
+                await self._refresh_keys(stale_keys)
                 if self._service_stop.is_set():
                     return
                 refreshed_after = time.monotonic()
@@ -201,7 +217,12 @@ class RouteRunner:
                     after=refreshed_after,
                     timeout_seconds=timeout,
                 )
-                for gap_id, stream_type, symbol in opened:
+                for stream_type, symbol, _affected_from_ns in stale:
+                    key = (stream_type, symbol)
+                    active = active_gaps.get(key)
+                    if active is None:
+                        continue
+                    gap_id, _opened_after = active
                     await self._gaps.close(
                         gap_id,
                         GapReason.CONNECTION_LOST,
@@ -209,30 +230,70 @@ class RouteRunner:
                         stream_types=(stream_type,),
                         detail="targeted subscriptions and L2 snapshots refreshed",
                     )
+                    del active_gaps[key]
             except (
                 QueueOverloaded,
                 aiohttp.ClientError,
                 OSError,
                 TimeoutError,
-            ):
-                logger.exception("targeted subscription refresh failed route=%s", self._name)
-                raise
+            ) as exc:
+                logger.warning(
+                    "targeted subscription recovery incomplete route=%s "
+                    "open_gaps=%d error=%s; will retry",
+                    self._name,
+                    len(active_gaps),
+                    exc,
+                    exc_info=True,
+                )
+                if isinstance(exc, QueueOverloaded):
+                    await self._queues.wait_until_resumable()
+                else:
+                    self._reconnect_requested.set()
 
-    async def _refresh_symbols(self, symbols: tuple[str, ...]) -> None:
+    async def _refresh_keys(self, keys: tuple[tuple[StreamType, str], ...]) -> None:
         if self._subscriptions_for is None:
             return
         async with self._update_lock:
-            streams = self._subscriptions_for(symbols)
-            completion = asyncio.get_running_loop().create_future()
-            await self._updates.put(
-                SubscriptionUpdate(
-                    add=streams,
-                    remove=streams,
-                    snapshot_requests=self._snapshot_requests_for(symbols),
-                    completion=completion,
-                )
+            streams = tuple(sorted(_liveness_subscription(key) for key in keys))
+            snapshots = tuple(
+                (symbol, _snapshot_type(stream_type))
+                for stream_type, symbol in keys
+                if stream_type in {StreamType.DEPTH, StreamType.RPI_DEPTH}
             )
-            await asyncio.wait_for(completion, timeout=180)
+            await self._submit_update(
+                add=streams,
+                remove=streams,
+                snapshot_requests=snapshots,
+            )
+
+    async def _submit_update(
+        self,
+        *,
+        add: tuple[str, ...],
+        remove: tuple[str, ...],
+        snapshot_requests: tuple[tuple[str, StreamType], ...],
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        acknowledged = loop.create_future()
+        completion = loop.create_future()
+        try:
+            async with asyncio.timeout(self._subscription_audit_timeout_seconds):
+                await self._updates.put(
+                    SubscriptionUpdate(
+                        add=add,
+                        remove=remove,
+                        snapshot_requests=snapshot_requests,
+                        acknowledged=acknowledged,
+                        completion=completion,
+                    )
+                )
+                await acknowledged
+            async with asyncio.timeout(180):
+                await completion
+        finally:
+            for future in (acknowledged, completion):
+                if not future.done():
+                    future.cancel()
 
     def _mark_event(self, stream_type: StreamType, symbol: str | None) -> None:
         key = (stream_type, symbol)
@@ -331,8 +392,12 @@ class RouteRunner:
             if outcome == "stop":
                 await _stop_handle(current)
                 return
-            if outcome == "failed":
-                error = _task_error(current.task)
+            if outcome in {"failed", "reconnect"}:
+                error = (
+                    _task_error(current.task)
+                    if outcome == "failed"
+                    else OSError("targeted subscription recovery requested route reconnect")
+                )
                 gap_reason = (
                     GapReason.INGEST_OVERLOAD
                     if isinstance(error, QueueOverloaded)
@@ -347,12 +412,15 @@ class RouteRunner:
                     affected_from_realtime_ns=_error_affected_from(error),
                 )
                 logger.warning(
-                    "connection failed route=%s connection_id=%s gap_id=%s error=%s",
+                    "connection %s route=%s connection_id=%s gap_id=%s error=%s",
+                    "failed" if outcome == "failed" else "reconnect requested",
                     self._name,
                     current.identity.connection_id,
                     gap_id,
                     error or "connection closed",
                 )
+                if outcome == "reconnect":
+                    await _stop_handle(current)
                 current = None
                 if gap_reason is GapReason.INGEST_OVERLOAD:
                     await self._queues.wait_until_resumable()
@@ -514,8 +582,10 @@ class RouteRunner:
     async def _wait_current(self, handle: ConnectionHandle) -> str:
         rotation = asyncio.create_task(asyncio.sleep(self._next_rotation_seconds))
         stopping = asyncio.create_task(self._service_stop.wait())
+        reconnecting = asyncio.create_task(self._reconnect_requested.wait())
         done, pending = await asyncio.wait(
-            (handle.task, rotation, stopping), return_when=asyncio.FIRST_COMPLETED
+            (handle.task, rotation, stopping, reconnecting),
+            return_when=asyncio.FIRST_COMPLETED,
         )
         for task in pending:
             if task is not handle.task:
@@ -523,7 +593,11 @@ class RouteRunner:
         if stopping in done and self._service_stop.is_set():
             return "stop"
         if handle.task in done:
+            self._reconnect_requested.clear()
             return "failed"
+        if reconnecting in done and self._reconnect_requested.is_set():
+            self._reconnect_requested.clear()
+            return "reconnect"
         self._next_rotation_seconds = self._rotation_seconds
         return "rotate"
 
@@ -1261,6 +1335,29 @@ class SourceManager:
                 await asyncio.gather(*routes)
             finally:
                 self._pollers = None
+
+
+def _liveness_subscription(key: tuple[StreamType, str]) -> str:
+    stream_type, symbol = key
+    suffixes = {
+        StreamType.DEPTH: "depth@100ms",
+        StreamType.RPI_DEPTH: "rpiDepth@500ms",
+        StreamType.BOOK_TICKER: "bookTicker",
+        StreamType.MARK_PRICE: "markPrice@1s",
+    }
+    try:
+        suffix = suffixes[stream_type]
+    except KeyError as exc:
+        raise ValueError(f"unsupported liveness subscription: {stream_type.value}") from exc
+    return f"{symbol.lower()}@{suffix}"
+
+
+def _snapshot_type(stream_type: StreamType) -> StreamType:
+    if stream_type is StreamType.DEPTH:
+        return StreamType.DEPTH_SNAPSHOT
+    if stream_type is StreamType.RPI_DEPTH:
+        return StreamType.RPI_DEPTH_SNAPSHOT
+    raise ValueError(f"stream has no snapshot type: {stream_type.value}")
 
 
 def _eligible_instruments(exchange_info: bytes) -> dict[str, int]:

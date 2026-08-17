@@ -32,6 +32,7 @@ class SubscriptionUpdate:
     add: tuple[str, ...]
     remove: tuple[str, ...]
     snapshot_requests: tuple[tuple[str, StreamType], ...]
+    acknowledged: asyncio.Future[None]
     completion: asyncio.Future[None]
 
 
@@ -47,6 +48,7 @@ class _PendingSubscriptionUpdate:
     add: tuple[str, ...]
     remove: tuple[str, ...]
     snapshot_requests: tuple[tuple[str, StreamType], ...]
+    acknowledged: asyncio.Future[None]
     completion: asyncio.Future[None]
 
 
@@ -287,6 +289,8 @@ class BinanceWebSocketConnection:
                     if update_task in done:
                         update = update_task.result()
                         update_task = asyncio.create_task(self._updates.get())
+                        if update.acknowledged.cancelled() or update.completion.cancelled():
+                            continue
                         self._snapshot_pending.update(update.snapshot_requests)
                         ids: set[int] = set()
                         for method, streams in (
@@ -311,12 +315,16 @@ class BinanceWebSocketConnection:
                             update.add,
                             update.remove,
                             update.snapshot_requests,
+                            update.acknowledged,
                             update.completion,
                         )
                         for update_id in ids:
                             pending_updates[update_id] = pending
                         if not ids:
-                            update.completion.set_result(None)
+                            if not update.acknowledged.done():
+                                update.acknowledged.set_result(None)
+                            if not update.completion.done():
+                                update.completion.set_result(None)
                     if audit_task in done:
                         if pending_audits:
                             raise SubscriptionAuditError(
@@ -410,6 +418,8 @@ class BinanceWebSocketConnection:
                             if not pending.remaining_ids:
                                 active_subscriptions.difference_update(pending.remove)
                                 active_subscriptions.update(pending.add)
+                                if not pending.acknowledged.done():
+                                    pending.acknowledged.set_result(None)
                                 if pending.snapshot_requests:
                                     task = asyncio.create_task(
                                         self._fetch_requested_snapshots(
@@ -437,10 +447,16 @@ class BinanceWebSocketConnection:
             if audit_task is not None:
                 audit_task.cancel()
             for pending in pending_updates.values():
-                if not pending.completion.done():
-                    pending.completion.set_exception(
-                        ConnectionError("connection closed during update")
-                    )
+                error = ConnectionError("connection closed during update")
+                if pending.acknowledged.cancelled():
+                    if not pending.completion.done():
+                        pending.completion.cancel()
+                elif not pending.acknowledged.done():
+                    pending.acknowledged.set_exception(error)
+                    if not pending.completion.done():
+                        pending.completion.cancel()
+                elif not pending.completion.done():
+                    pending.completion.set_exception(error)
             tasks = list(self._resync_tasks.values())
             if snapshot_task is not None:
                 tasks.append(snapshot_task)
