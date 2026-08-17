@@ -23,11 +23,11 @@ module -t avail 2>&1 | grep apptainer
 command -v crontab flock sbatch ssh
 ```
 
-新装时使用 v0.3.2 的仓库目录、`ft-shadow-data-plane.sif`、对应 SHA-256 文件，以及 Vultr 已授权的
+新装时使用 v0.3.3 的仓库目录、`ft-shadow-data-plane.sif`、对应 SHA-256 文件，以及 Vultr 已授权的
 `~/.ssh/ft-data-puller` 私钥。
 
-v0.3.2 只修改 edge 重连路径，没有修改 107 的 pull 或 central 派生处理。已经安装 v0.3.1 的
-107 不需要为接收 v0.3.2 raw 而升级；继续保持 cron 即可。
+v0.3.3 只修改 edge 订阅恢复路径，没有修改 107 的 pull 或 central 派生处理。已经安装 v0.3.1 或
+v0.3.2 的 107 不需要为接收 v0.3.3 raw 而升级；继续保持 cron 即可。
 
 ## 2. clean start
 
@@ -59,7 +59,7 @@ rm -rf -- \
 mkdir -p /home/scc/pb24000367/Projects/bn/data
 ```
 
-## 3. 校验并安装 v0.3.2
+## 3. 校验并安装 v0.3.3
 
 ```bash
 cd /home/scc/pb24000367/Projects/bn/ft-shadow-data-plane

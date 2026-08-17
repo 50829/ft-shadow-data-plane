@@ -1,4 +1,4 @@
-# v0.3.1 正式采集实施合同
+# v0.3.3 正式采集实施合同
 
 ## 本阶段目标
 
@@ -68,11 +68,13 @@ seal；它不停止或重建任何 Binance 连接，也不产生 `PLANNED_BOUNDA
 core 出现计划中断。
 
 WebSocket 30 秒无任何消息会重连整个异常连接。每个币的 `depth` 与 `bookTicker` 分别以 30 秒
-保守阈值监控，`markPrice@1s` 以 5 秒监控；超时只刷新该币并从最后已证明事件时刻打开
-symbol/stream-scoped `CONNECTION_LOST_GAP`。刷新 ACK 不代表恢复，必须看到对应 stream 的第一条
-新事件才关闭 gap，L2 validity 还必须等待 snapshot bridge。每条连接每 60 秒执行一次
-`LIST_SUBSCRIPTIONS`，响应 deadline 为 10 秒；集合不一致或审计响应自身超时都使连接失败，gap
-从上一次成功审计的 proof timestamp 起算。`aggTrade`、`forceOrder` 和
+保守阈值监控，`markPrice@1s` 以 5 秒监控；超时只重订阅准确的 `(stream, symbol)`，并从最后已
+证明事件时刻打开 symbol/stream-scoped `CONNECTION_LOST_GAP`。控制 ACK 使用独立 10 秒 deadline，
+snapshot completion 最长等待 180 秒；ACK 不代表恢复，必须看到对应 stream 的第一条新事件才关闭
+scoped gap，L2 validity 还必须等待 snapshot bridge。局部恢复失败时只重建所属 route，并为该 route
+被主动中断的全部 symbol/stream 打开 transport gap；其他 route、REST poller 和 writer 继续工作。
+每条连接每 60 秒执行一次 `LIST_SUBSCRIPTIONS`，响应 deadline 为 10 秒；集合不一致或审计响应自身
+超时都使当前 route 连接失败，gap 从上一次成功审计的 proof timestamp 起算。`aggTrade`、`forceOrder` 和
 `contractInfo` 因天然稀疏不使用事件 deadline。L2 `pu/u` 不连续时单独记录
 `L2_SEQUENCE_GAP` 并重新取 snapshot。
 
@@ -112,7 +114,7 @@ ticker 响应的 SHA-256。该事件时间之后的数据属于正式实验。24
 目标机器为 1 vCPU、1GiB RAM、25GB 磁盘，不允许通过减少币数或降低采集频率达标。
 
 - Docker：`0.90 CPU`、`768MiB`、`256 PIDs`；
-- 2 个稳定 hash public shards，WebSocket queue 为 4，单消息上限 2MiB；
+- 4 个稳定 hash public shards，WebSocket queue 为 4，单消息上限 2MiB；
 - raw queue 总字节上限 64MiB，70% 告警，50% 恢复；
 - writer batch 上限 2000 events 或 2MiB；
 - RSS p95 不超过 600MiB，峰值不超过 700MiB，无 OOM；

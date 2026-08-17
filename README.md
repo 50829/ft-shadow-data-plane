@@ -1,6 +1,6 @@
 # ft-shadow-data-plane
 
-Binance USD-M 正式数据采集与重建流水线。v0.3.2 从 generation 1 直接采集 60 个合约：
+Binance USD-M 正式数据采集与重建流水线。v0.3.3 从 generation 1 直接采集 60 个合约：
 50 core、5 boundary、5 probe。
 
 ```text
@@ -41,3 +41,8 @@ v0.3.2 把异常重连的 transport recovery 与 L2 snapshot readiness 分开：
 stream 的首事件证明 raw 恢复后即关闭 transport gap，但每个币仍须独立完成 snapshot bridge 才能
 重新进入 L2 `VALID`。正式 public 路由使用 4 个分片，降低单连接故障的币种范围和最慢重锚时间。
 官方约束和定量依据见 [重连恢复调研](docs/binance-reconnect-recovery-research-2026-08-12.md)。
+
+v0.3.3 将静默 stream 的恢复精确到 `(stream, symbol)`，控制 ACK 采用独立 10 秒 deadline；局部刷新
+失败时只重建所属 route，并为主动中断的 route 完整登记 gap，不再让 180 秒 refresh timeout 终止
+全部 60 币。历史 gap 内未收到的事件不能补回，边界与生产清点见
+[v0.3.3 完整性调研](docs/v0.3.3-gap-integrity-recovery-research-2026-08-17.md)。

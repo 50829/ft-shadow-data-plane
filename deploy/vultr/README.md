@@ -1,6 +1,6 @@
 # Vultr 正式采集部署
 
-本手册适用于 `167.179.115.243` 上的 v0.3.2 collector。数据根为
+本手册适用于 `167.179.115.243` 上的 v0.3.3 collector。数据根为
 `/srv/ft-data-rsync`，collector 和受限传输账户都使用 UID/GID 10001。
 
 ## 1. 前置条件
@@ -19,7 +19,7 @@ timedatectl status
 
 ## 2. 安装目录和服务
 
-在 v0.3.2 仓库根目录执行：
+在 v0.3.3 仓库根目录执行：
 
 ```bash
 sudo ./deploy/vultr/install.sh
@@ -69,7 +69,7 @@ ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
 
 ## 4. 配置正式 60 币和镜像
 
-`/etc/ft-shadow-data-plane/edge.yaml` 必须使用仓库 v0.3.2 示例。核对三个角色为 50/5/5、
+`/etc/ft-shadow-data-plane/edge.yaml` 必须使用仓库 v0.3.3 示例。核对三个角色为 50/5/5、
 `bootstrap_evidence_sha256` 与正式报告一致、`automation_enabled: true`、public shards 为 4，
 queue 为 64MiB。不要加入旧字段。
 
@@ -93,7 +93,7 @@ docker image inspect "$EDGE_IMAGE" --format '{{json .RepoDigests}}'
 
 Compose 已固定 0.90 CPU、768MiB RAM、256 PIDs、只读 rootfs 和日志轮换。
 
-## 5. v0.3.2 clean start
+## 5. v0.3.3 clean start
 
 只有在确认旧数据无需保留时执行。以下删除不可恢复，目标必须逐项等于显示值：
 
@@ -137,10 +137,11 @@ journalctl -u ft-shadow-data-plane.service -f
 只有出现以下日志后才进入正式时间范围：
 
 ```text
-FORMAL_COLLECTION_STARTED ... generation=1 symbols=60
+FORMAL_COLLECTION_STARTED ... generation=<current> symbols=60
 ```
 
-collector 会用最新 14 个完整 UTC 日、5 次 bookTicker 和 3 次 depth 验证冻结的 generation 1。
+clean start 时 collector 会用最新 14 个完整 UTC 日、5 次 bookTicker 和 3 次 depth 验证冻结的
+generation 1；保状态升级必须保持部署前的 current generation 和 universe hash。
 若两次状态请求发现非交易合约，或任何已配置成员跌破角色硬门槛，它会拒绝写正式标记并退出。
 合格池内部因瞬时盘口产生的排名变化不会改写冻结名单。失败时必须重新冻结证据和配置，再执行
 clean start；不要绕过检查或减少总数。
@@ -208,3 +209,20 @@ p95/p99。若 OOM、RSS 峰值超过 700MiB、CPU p95 超过 80%、queue 连续�
 `public_connection_shards` 从 2 改为 4。v0.3.2 没有修改 107 pull/central 行为，107 已安装的
 v0.3.1 可继续运行。服务重启后必须看到 transport recovery、snapshot ready、collector status，
 并确认 `open-gaps` 为空。
+
+从 v0.3.2 升级 v0.3.3 时同样禁止 clean start。升级前保存以下只读基线：
+
+```bash
+sudo cp -a /etc/ft-shadow-data-plane/edge.env /etc/ft-shadow-data-plane/edge.env.v0.3.2
+sudo jq '{generation,core,boundary,probe,universe_hash}' \
+  /srv/ft-data-rsync/control/universe/active.json
+sudo sha256sum /srv/ft-data-rsync/control/formal-start.json \
+  /srv/ft-data-rsync/control/universe/active.json
+sudo find /srv/ft-data-rsync/control/open-gaps -maxdepth 1 -type f -print
+```
+
+只安装新的 `/opt/ft-shadow-data-plane/deploy/vultr` 并把 `EDGE_IMAGE` 改为 v0.3.3 immutable digest，
+不要覆盖现有 `edge.yaml`。执行一次受控重启后，重新核对上述 hash、generation 和 60 个成员不变；
+日志应出现各 route ready，`open-gaps` 最终为空，且不再出现 refresh timeout 导致的 collector 全局
+退出。该版本将 refresh 限定到准确 subscription；控制状态不可信时只重建一个 route，并为 route
+内所有受影响 stream 留下显式 gap。
