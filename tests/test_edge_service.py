@@ -8,8 +8,9 @@ from typing import Any
 import pytest
 from pydantic import BaseModel
 
-from ft_shadow_data_plane.contracts.models import StreamType
+from ft_shadow_data_plane.contracts.models import GapReason, StreamType
 from ft_shadow_data_plane.edge.service import EdgeService
+from ft_shadow_data_plane.edge.spool import SpoolStatus
 
 
 class OnlineSources:
@@ -20,6 +21,56 @@ class OnlineSources:
 
     async def update_instruments(self, members: tuple[str, ...]) -> None:
         self.updates.append(members)
+
+
+class StorageSources:
+    def __init__(self, *, running: bool) -> None:
+        self.running = running
+        self.start_calls = 0
+        self.stop_calls = 0
+        self.ready_calls = 0
+
+    def raise_if_failed(self) -> None:
+        return None
+
+    async def start(self, _members: tuple[str, ...]) -> None:
+        if self.running:
+            raise RuntimeError("sources already running")
+        self.start_calls += 1
+        self.running = True
+
+    async def stop(self) -> None:
+        self.stop_calls += 1
+        self.running = False
+
+    async def wait_ready(self) -> None:
+        self.ready_calls += 1
+
+
+class StorageSpool:
+    def __init__(self, status: SpoolStatus, stop: asyncio.Event) -> None:
+        self._status = status
+        self._stop = stop
+
+    def apply_acks(self) -> int:
+        return 0
+
+    def status(self) -> SpoolStatus:
+        self._stop.set()
+        return self._status
+
+
+class StorageGaps:
+    def __init__(self) -> None:
+        self.opened: list[GapReason] = []
+        self.closed: list[tuple[str, GapReason]] = []
+
+    async def open(self, reason: GapReason, **_kwargs: object) -> str:
+        self.opened.append(reason)
+        return "gap-new"
+
+    async def close(self, gap_id: str, reason: GapReason, **_kwargs: object) -> None:
+        self.closed.append((gap_id, reason))
 
 
 class BoundaryGaps:
@@ -119,6 +170,38 @@ async def test_one_symbol_change_only_marks_changed_symbols() -> None:
     assert service._ingest.rotations == ["b" * 64, "b" * 64]  # type: ignore[attr-defined]
 
 
+@pytest.mark.asyncio
+async def test_recovered_storage_gap_does_not_restart_running_sources() -> None:
+    service = _storage_service(
+        SpoolStatus(used_bytes=100, free_bytes=1_000, hard_limited=False),
+        sources_running=True,
+        storage_gap_id="gap-stale",
+    )
+
+    await service._storage_loop()
+
+    assert service._sources.start_calls == 0
+    assert service._sources.stop_calls == 0
+    assert service._gaps.closed == [("gap-stale", GapReason.STORAGE_EXHAUSTED)]
+    assert service._storage_gap_id is None
+
+
+@pytest.mark.asyncio
+async def test_existing_storage_gap_stops_sources_when_limit_is_still_hard() -> None:
+    service = _storage_service(
+        SpoolStatus(used_bytes=1_000, free_bytes=100, hard_limited=True),
+        sources_running=True,
+        storage_gap_id="gap-stale",
+    )
+
+    await service._storage_loop()
+
+    assert service._sources.start_calls == 0
+    assert service._sources.stop_calls == 1
+    assert service._gaps.closed == []
+    assert service._storage_gap_id == "gap-stale"
+
+
 def _service(previous: object, decision: object | None) -> Any:
     service: Any = object.__new__(EdgeService)
     service._sources = OnlineSources()
@@ -136,6 +219,32 @@ def _service(previous: object, decision: object | None) -> Any:
         return None
 
     service._emit_control_event = record_control
+    return service
+
+
+def _storage_service(
+    status: SpoolStatus,
+    *,
+    sources_running: bool,
+    storage_gap_id: str | None,
+) -> Any:
+    service: Any = object.__new__(EdgeService)
+    service._stop = asyncio.Event()
+    service._operation_lock = asyncio.Lock()
+    service._sources = StorageSources(running=sources_running)
+    service._spool = StorageSpool(status, service._stop)
+    service._gaps = StorageGaps()
+    service._storage_gap_id = storage_gap_id
+    service._stale_gaps = ()
+    service._universe_store = SimpleNamespace(active=SimpleNamespace(members=_members()))
+    service._config = SimpleNamespace(storage_check_seconds=0)
+
+    async def no_op() -> None:
+        return None
+
+    service._close_stale_gaps = no_op
+    service._seal_completed_days = no_op
+    service._mark_formal_start = no_op
     return service
 
 

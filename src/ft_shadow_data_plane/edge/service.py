@@ -183,19 +183,25 @@ class EdgeService:
                 status = await asyncio.to_thread(self._spool.status)
                 if removed:
                     logger.info("garbage-collected ACKed chunks count=%d", removed)
-                if status.hard_limited and self._storage_gap_id is None:
-                    self._storage_gap_id = await self._gaps.open(
-                        GapReason.STORAGE_EXHAUSTED,
-                        exchange_symbols=self._universe_store.active.members,
-                        detail=(f"spool_bytes={status.used_bytes} free_bytes={status.free_bytes}"),
-                    )
-                    await self._sources.stop()
-                elif not status.hard_limited and self._storage_gap_id is not None:
-                    await self._sources.start(self._universe_store.active.members)
-                    await self._sources.wait_ready()
-                    await self._close_stale_gaps()
-                    await self._seal_completed_days()
-                    await self._mark_formal_start()
+                if status.hard_limited:
+                    if self._storage_gap_id is None:
+                        self._storage_gap_id = await self._gaps.open(
+                            GapReason.STORAGE_EXHAUSTED,
+                            exchange_symbols=self._universe_store.active.members,
+                            detail=(
+                                f"spool_bytes={status.used_bytes} "
+                                f"free_bytes={status.free_bytes}"
+                            ),
+                        )
+                    if self._sources.running:
+                        await self._sources.stop()
+                elif self._storage_gap_id is not None:
+                    if not self._sources.running:
+                        await self._sources.start(self._universe_store.active.members)
+                        await self._sources.wait_ready()
+                        await self._close_stale_gaps()
+                        await self._seal_completed_days()
+                        await self._mark_formal_start()
                     await self._gaps.close(
                         self._storage_gap_id,
                         GapReason.STORAGE_EXHAUSTED,
