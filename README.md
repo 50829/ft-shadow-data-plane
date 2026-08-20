@@ -1,6 +1,6 @@
 # ft-shadow-data-plane
 
-Binance USD-M 正式数据采集与重建流水线。v0.3.3 从 generation 1 直接采集 60 个合约：
+Binance USD-M 正式数据采集与重建流水线。v0.3.4 从 generation 1 直接采集 60 个合约：
 50 core、5 boundary、5 probe。
 
 ```text
@@ -46,3 +46,8 @@ v0.3.3 将静默 stream 的恢复精确到 `(stream, symbol)`，控制 ACK 采�
 失败时只重建所属 route，并为主动中断的 route 完整登记 gap，不再让 180 秒 refresh timeout 终止
 全部 60 币。历史 gap 内未收到的事件不能补回，边界与生产清点见
 [v0.3.3 完整性调研](docs/v0.3.3-gap-integrity-recovery-research-2026-08-17.md)。
+
+v0.3.4 修复持久化 `STORAGE_EXHAUSTED_GAP` 跨进程恢复时重复启动 Binance sources 的 crash loop；
+存储硬限制仍会先登记 gap 再暂停采集，空间恢复后只启动一次 sources，并在完整 readiness 后关闭 gap。
+107 协议和数据合同没有变化。事故边界和升级要求见
+[v0.3.4 存储恢复事故记录](docs/v0.3.4-storage-recovery-incident-2026-08-20.md)。

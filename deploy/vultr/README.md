@@ -1,6 +1,6 @@
 # Vultr 正式采集部署
 
-本手册适用于 `167.179.115.243` 上的 v0.3.3 collector。数据根为
+本手册适用于 `167.179.115.243` 上的 v0.3.4 collector。数据根为
 `/srv/ft-data-rsync`，collector 和受限传输账户都使用 UID/GID 10001。
 
 ## 1. 前置条件
@@ -19,7 +19,7 @@ timedatectl status
 
 ## 2. 安装目录和服务
 
-在 v0.3.3 仓库根目录执行：
+在 v0.3.4 仓库根目录执行：
 
 ```bash
 sudo ./deploy/vultr/install.sh
@@ -69,7 +69,7 @@ ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
 
 ## 4. 配置正式 60 币和镜像
 
-`/etc/ft-shadow-data-plane/edge.yaml` 必须使用仓库 v0.3.3 示例。核对三个角色为 50/5/5、
+`/etc/ft-shadow-data-plane/edge.yaml` 必须使用仓库 v0.3.4 示例。核对三个角色为 50/5/5、
 `bootstrap_evidence_sha256` 与正式报告一致、`automation_enabled: true`、public shards 为 4，
 queue 为 64MiB。不要加入旧字段。
 
@@ -93,7 +93,7 @@ docker image inspect "$EDGE_IMAGE" --format '{{json .RepoDigests}}'
 
 Compose 已固定 0.90 CPU、768MiB RAM、256 PIDs、只读 rootfs 和日志轮换。
 
-## 5. v0.3.3 clean start
+## 5. v0.3.4 clean start
 
 只有在确认旧数据无需保留时执行。以下删除不可恢复，目标必须逐项等于显示值：
 
@@ -226,3 +226,9 @@ sudo find /srv/ft-data-rsync/control/open-gaps -maxdepth 1 -type f -print
 日志应出现各 route ready，`open-gaps` 最终为空，且不再出现 refresh timeout 导致的 collector 全局
 退出。该版本将 refresh 限定到准确 subscription；控制状态不可信时只重建一个 route，并为 route
 内所有受影响 stream 留下显式 gap。
+
+从 v0.3.3 升级 v0.3.4 时禁止 clean start，并先保存 generation、formal-start、active universe 哈希
+和 OPEN gap 列表。只替换 immutable edge image；不得覆盖 `edge.yaml`，不得删除
+`control/open-gaps`。新容器完整 ready 后，遗留 `STORAGE_EXHAUSTED_GAP` 和
+`COLLECTOR_STOPPED_GAP` 应自动关闭，`sources already running` 不得再次出现。继续观察至少两个
+collector status 周期，并确认 ready chunk 和 107 ACK 均持续推进。107 不需要升级。
