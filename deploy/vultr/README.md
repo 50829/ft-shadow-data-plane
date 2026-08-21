@@ -1,6 +1,6 @@
 # Vultr 正式采集部署
 
-本手册适用于 `167.179.115.243` 上的 v0.3.5 collector。数据根为
+本手册适用于 `167.179.115.243` 上的 v0.3.6 collector。数据根为
 `/srv/ft-data-rsync`，collector 和受限传输账户都使用 UID/GID 10001。
 
 ## 1. 前置条件
@@ -19,7 +19,7 @@ timedatectl status
 
 ## 2. 安装目录和服务
 
-在 v0.3.5 仓库根目录执行：
+在 v0.3.6 仓库根目录执行：
 
 ```bash
 sudo ./deploy/vultr/install.sh
@@ -69,7 +69,7 @@ ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
 
 ## 4. 配置正式 60 币和镜像
 
-`/etc/ft-shadow-data-plane/edge.yaml` 必须使用仓库 v0.3.5 示例。核对三个角色为 50/5/5、
+`/etc/ft-shadow-data-plane/edge.yaml` 必须使用仓库 v0.3.6 示例。核对三个角色为 50/5/5、
 `bootstrap_evidence_sha256` 与正式报告一致、`automation_enabled: true`、public shards 为 4，
 queue 为 64MiB。不要加入旧字段。
 
@@ -93,7 +93,7 @@ docker image inspect "$EDGE_IMAGE" --format '{{json .RepoDigests}}'
 
 Compose 已固定 0.90 CPU、768MiB RAM、256 PIDs、只读 rootfs 和日志轮换。
 
-## 5. v0.3.5 clean start
+## 5. v0.3.6 clean start
 
 只有在 collector 已停止、107 已经拉到 `new_chunks=0 failures=0`，且旧 control/evidence/gap tar
 已传到 107 并通过 SHA-256 校验后执行。Vultr 容量不足以长期保留第二份 spool，因此远端 active
@@ -240,3 +240,6 @@ collector status 周期，并确认 ready chunk 和 107 ACK 均持续推进。10
 [clean start 手册](../../docs/v0.3.5-structured-universe-clean-start.md) 先把所有 ready 拉到 107，
 再归档 107 旧 raw/runtime 和 Vultr 旧 control/evidence/gap。只有归档验证完成后才清空 Vultr active
 数据路径，以新配置直接启动 `6.2 / sequence 8`。代码不读取旧 generation 文件。
+
+从 v0.3.5 升级 v0.3.6 不改变 edge 配置、raw 或 universe 合同。107 必须升级，以避免每分钟 pull
+对字节完全一致、已经发布的历史 `SEALED.json` 重复哈希全部 chunk；某日第一次发布仍执行完整校验。

@@ -1,6 +1,6 @@
 # ft-shadow-data-plane
 
-Binance USD-M 正式数据采集与重建流水线。v0.3.5 持续采集 60 个合约：
+Binance USD-M 正式数据采集与重建流水线。v0.3.6 持续采集 60 个合约：
 50 core、5 boundary、5 probe。
 
 ```text
@@ -60,3 +60,7 @@ v0.3.5 将 universe 身份拆成 `core_generation.candidate_revision`：50 个 c
 storage gap OPEN、清理半启动 sources，并在下一轮重试。旧 generation 数据只归档、不混入新
 数据路径；运行时代码不含兼容层。部署边界见
 [v0.3.5 结构化 universe clean start](docs/v0.3.5-structured-universe-clean-start.md)。
+
+v0.3.6 避免 107 每分钟对已经发布且 manifest 完全一致的历史 sealed day 重复扫描全部 raw
+SHA-256。某日首次发布时仍逐 chunk 校验，远端 sealed manifest 冲突仍 fail closed；该补丁不改变
+edge、raw、universe 或正式 60 币身份。
