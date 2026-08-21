@@ -222,12 +222,6 @@ class CentralPuller:
         content = self._remote.read_bytes(remote_day_path)
         manifest = DayManifestV1.model_validate_json(content)
         collector_root = self._local_raw_root / f"collector={manifest.collector_id}"
-        for chunk in manifest.chunks:
-            path = collector_root / chunk.data_path
-            if not path.exists() or path.stat().st_size != chunk.size_bytes:
-                return False
-            if sha256_file(path) != chunk.sha256:
-                raise ValueError(f"day manifest hash mismatch: {path}")
         destination = (
             collector_root
             / "day-manifests"
@@ -238,6 +232,12 @@ class CentralPuller:
             if destination.read_bytes() != content:
                 raise ValueError(f"conflicting sealed day manifest: {destination}")
             return True
+        for chunk in manifest.chunks:
+            path = collector_root / chunk.data_path
+            if not path.exists() or path.stat().st_size != chunk.size_bytes:
+                return False
+            if sha256_file(path) != chunk.sha256:
+                raise ValueError(f"day manifest hash mismatch: {path}")
         atomic_write_bytes(destination, content)
         return True
 

@@ -68,6 +68,29 @@ def test_hash_mismatch_never_acknowledges(tmp_path: Path) -> None:
     assert f"control/acks/{manifest.chunk_id}.ack.json" not in remote.writes
 
 
+def test_matching_sealed_day_is_not_rehashed_on_every_pull(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remote, _manifest = _remote_fixture(b"valid parquet stand-in")
+    puller = CentralPuller(
+        remote,
+        remote_ready_root="ready",
+        remote_ack_root="control/acks",
+        local_raw_root=tmp_path,
+    )
+    assert puller.run() == (1, 0)
+    remote.files = {
+        path: content for path, content in remote.files.items() if path.endswith("/SEALED.json")
+    }
+
+    def unexpected_hash(_path: Path) -> str:
+        raise AssertionError("an already-published sealed day must not be rehashed")
+
+    monkeypatch.setattr("ft_shadow_data_plane.central.pull.sha256_file", unexpected_hash)
+
+    assert puller.run() == (0, 0)
+
+
 def test_rsync_transport_pins_ssh_identity_and_host_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
