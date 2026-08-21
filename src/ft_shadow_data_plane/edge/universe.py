@@ -14,9 +14,9 @@ from ft_shadow_data_plane.central.selector import (
     validate_bootstrap_universe,
 )
 from ft_shadow_data_plane.contracts.models import (
-    CandidateOverrideV1,
+    CandidateOverride,
+    UniverseDecision,
     UniverseDecisionReason,
-    UniverseDecisionV1,
 )
 from ft_shadow_data_plane.contracts.serde import (
     atomic_write_bytes,
@@ -39,17 +39,17 @@ class UniverseStore:
         self._evaluations = self._root / "evaluations"
         self._overrides = self._root / "candidate-overrides"
         self._policy = policy
-        self._active: UniverseDecisionV1 | None = None
+        self._active: UniverseDecision | None = None
         self._member_since: dict[str, datetime] = {}
         self._core_since: dict[str, datetime] = {}
 
     @property
-    def active(self) -> UniverseDecisionV1:
+    def active(self) -> UniverseDecision:
         if self._active is None:
             raise RuntimeError("universe store has not been initialized")
         return self._active
 
-    def initialize(self, now: datetime | None = None) -> UniverseDecisionV1:
+    def initialize(self, now: datetime | None = None) -> UniverseDecision:
         now = now or datetime.now(UTC)
         for path in (
             self._observations,
@@ -59,12 +59,15 @@ class UniverseStore:
         ):
             path.mkdir(parents=True, exist_ok=True)
         if self._active_path.exists():
-            self._active = UniverseDecisionV1.model_validate_json(self._active_path.read_bytes())
+            self._active = UniverseDecision.model_validate_json(self._active_path.read_bytes())
             self._load_state()
             return self._active
         policy = self._policy
-        self._active = UniverseDecisionV1(
-            generation=1,
+        self._active = UniverseDecision(
+            core_generation=policy.core_generation,
+            candidate_revision=policy.candidate_revision,
+            decision_sequence=policy.decision_sequence,
+            universe_version=f"{policy.core_generation}.{policy.candidate_revision}",
             created_at=now,
             effective_at=now,
             reason=UniverseDecisionReason.FORMAL_BOOTSTRAP,
@@ -85,7 +88,7 @@ class UniverseStore:
         snapshot: DiscoverySnapshot,
         *,
         now: datetime | None = None,
-    ) -> UniverseDecisionV1 | None:
+    ) -> UniverseDecision | None:
         now = now or snapshot.observed_at
         self._write_observation(snapshot)
         effective_at = _next_effective_at(now, self._policy.decision_cutoff_minute_utc)
@@ -130,8 +133,12 @@ class UniverseStore:
         ):
             self._pending_path.unlink(missing_ok=True)
             return None
-        decision = UniverseDecisionV1(
-            generation=self.active.generation + 1,
+        core_generation, candidate_revision = _next_version(self.active, result.core)
+        decision = UniverseDecision(
+            core_generation=core_generation,
+            candidate_revision=candidate_revision,
+            decision_sequence=self.active.decision_sequence + 1,
+            universe_version=f"{core_generation}.{candidate_revision}",
             created_at=now,
             effective_at=effective_at,
             reason=reason,
@@ -159,7 +166,10 @@ class UniverseStore:
                 self._policy.stable_pool_warning_size,
             )
         evaluation = {
-            "active_generation": self.active.generation,
+            "active_core_generation": self.active.core_generation,
+            "active_candidate_revision": self.active.candidate_revision,
+            "active_decision_sequence": self.active.decision_sequence,
+            "active_universe_version": self.active.universe_version,
             "boundary": list(result.boundary),
             "core": list(result.core),
             "effective_at": effective_at.isoformat(),
@@ -177,7 +187,7 @@ class UniverseStore:
     def has_due(self, now: datetime) -> bool:
         return self._select_due(now) is not None
 
-    def apply_due(self, now: datetime | None = None) -> UniverseDecisionV1 | None:
+    def apply_due(self, now: datetime | None = None) -> UniverseDecision | None:
         now = now or datetime.now(UTC)
         selected = self._select_due(now)
         if selected is None:
@@ -206,25 +216,43 @@ class UniverseStore:
         self._pending_path.unlink(missing_ok=True)
         return decision
 
-    def _select_due(self, now: datetime) -> tuple[UniverseDecisionV1, Path] | None:
-        candidates: list[tuple[UniverseDecisionV1, Path]] = []
+    def _select_due(self, now: datetime) -> tuple[UniverseDecision, Path] | None:
+        candidates: list[tuple[UniverseDecision, Path]] = []
         if self._pending_path.exists():
-            pending = UniverseDecisionV1.model_validate_json(self._pending_path.read_bytes())
-            if pending.generation > self.active.generation and pending.effective_at <= now:
+            pending = UniverseDecision.model_validate_json(self._pending_path.read_bytes())
+            if (
+                pending.decision_sequence > self.active.decision_sequence
+                and pending.effective_at <= now
+            ):
                 candidates.append((pending, self._pending_path))
         for path in self._overrides.glob("*.override.json"):
             try:
-                override = CandidateOverrideV1.model_validate_json(path.read_bytes())
+                override = CandidateOverride.model_validate_json(path.read_bytes())
                 decision = self._decision_from_override(override)
             except ValueError:
                 logger.exception("rejecting invalid candidate override path=%s", path)
                 path.replace(path.with_suffix(".rejected.json"))
                 continue
-            if decision.generation > self.active.generation and decision.effective_at <= now:
+            if (
+                decision.decision_sequence > self.active.decision_sequence
+                and decision.effective_at <= now
+            ):
                 candidates.append((decision, path))
-        return max(candidates, key=lambda item: item[0].generation) if candidates else None
+        return (
+            max(
+                candidates,
+                key=lambda item: (
+                    item[0].decision_sequence,
+                    item[0].effective_at,
+                    item[0].created_at,
+                    item[1].name,
+                ),
+            )
+            if candidates
+            else None
+        )
 
-    def _decision_from_override(self, override: CandidateOverrideV1) -> UniverseDecisionV1:
+    def _decision_from_override(self, override: CandidateOverride) -> UniverseDecision:
         proposed = set((*override.boundary, *override.probe))
         if proposed & set(self.active.core):
             raise ValueError("candidate override cannot include active core members")
@@ -241,8 +269,13 @@ class UniverseStore:
         ]
         if too_young:
             raise ValueError(f"candidate override violates dwell: {too_young}")
-        return UniverseDecisionV1(
-            generation=override.generation,
+        return UniverseDecision(
+            core_generation=self.active.core_generation,
+            candidate_revision=self.active.candidate_revision + 1,
+            decision_sequence=self.active.decision_sequence + 1,
+            universe_version=(
+                f"{self.active.core_generation}.{self.active.candidate_revision + 1}"
+            ),
             created_at=override.created_at,
             effective_at=override.effective_at,
             reason=UniverseDecisionReason.MANUAL_CANDIDATE_OVERRIDE,
@@ -283,10 +316,14 @@ class UniverseStore:
             symbol: datetime.fromisoformat(value) for symbol, value in raw["core_since"].items()
         }
 
-    def _write_active(self, decision: UniverseDecisionV1) -> None:
+    def _write_active(self, decision: UniverseDecision) -> None:
         atomic_write_bytes(self._active_path, canonical_json_bytes(decision))
         atomic_write_bytes(
-            self._decisions / f"{decision.generation}.decision.json",
+            self._decisions
+            / (
+                f"sequence-{decision.decision_sequence:08d}."
+                f"version-{decision.universe_version}.decision.json"
+            ),
             canonical_json_bytes(decision),
         )
 
@@ -316,10 +353,16 @@ def _next_effective_at(now: datetime, cutoff_minute: int) -> datetime:
 
 
 def _decision_reason(
-    active: UniverseDecisionV1, result: SelectionResult, effective_at: datetime
+    active: UniverseDecision, result: SelectionResult, effective_at: datetime
 ) -> UniverseDecisionReason:
     if result.inactive:
         return UniverseDecisionReason.INACTIVE_REPLACEMENT
     if result.core != active.core and effective_at.weekday() == 0:
         return UniverseDecisionReason.WEEKLY_CORE
     return UniverseDecisionReason.DAILY_CANDIDATE
+
+
+def _next_version(active: UniverseDecision, core: tuple[str, ...]) -> tuple[int, int]:
+    if core != active.core:
+        return active.core_generation + 1, 0
+    return active.core_generation, active.candidate_revision + 1

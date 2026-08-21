@@ -9,7 +9,7 @@ from typing import Any
 
 import orjson
 
-from ft_shadow_data_plane.contracts.models import SYMBOL_PATTERN, UniverseDecisionV1
+from ft_shadow_data_plane.contracts.models import SYMBOL_PATTERN, UniverseDecision
 from ft_shadow_data_plane.contracts.serde import (
     atomic_write_bytes,
     canonical_json_bytes,
@@ -201,7 +201,7 @@ def validate_bootstrap_universe(
     missing_probe = sorted(probe_symbols - qualified_probe_symbols)
     if missing_stable or missing_probe:
         raise ValueError(
-            "configured generation 1 members fail current formal liquidity gates: "
+            "configured bootstrap members fail current formal liquidity gates: "
             f"stable={missing_stable} probe={missing_probe}"
         )
     if len(stable_pool) < 55:
@@ -264,7 +264,7 @@ def liquidity_validation_symbols(
 
 
 def select_rolling_universe(
-    active: UniverseDecisionV1,
+    active: UniverseDecision,
     snapshot: DiscoverySnapshot,
     *,
     effective_at: datetime,
@@ -401,7 +401,7 @@ def select_rolling_universe(
 
 
 def write_formal_bundle(
-    decision: UniverseDecisionV1,
+    decision: UniverseDecision,
     output_dir: Path,
     *,
     snapshot: DiscoverySnapshot,

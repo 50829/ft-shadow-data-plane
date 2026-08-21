@@ -4,20 +4,18 @@ import argparse
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ft_shadow_data_plane.contracts.models import CandidateOverrideV1
+from ft_shadow_data_plane.contracts.models import CandidateOverride
 from ft_shadow_data_plane.contracts.serde import atomic_write_bytes, canonical_json_bytes
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Create a candidate-only universe override")
-    parser.add_argument("--generation", type=int, required=True)
     parser.add_argument("--effective-at", type=_utc_datetime, required=True)
     parser.add_argument("--boundary-file", type=Path, required=True)
     parser.add_argument("--probe-file", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    override = CandidateOverrideV1(
-        generation=args.generation,
+    override = CandidateOverride(
         created_at=datetime.now(UTC),
         effective_at=args.effective_at,
         boundary=_members(args.boundary_file),

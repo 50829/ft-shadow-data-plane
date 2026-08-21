@@ -10,7 +10,7 @@ from ft_shadow_data_plane.central.selector import (
     select_bootstrap_universe,
     select_rolling_universe,
 )
-from ft_shadow_data_plane.contracts.models import UniverseDecisionReason, UniverseDecisionV1
+from ft_shadow_data_plane.contracts.models import UniverseDecision, UniverseDecisionReason
 from ft_shadow_data_plane.contracts.serde import universe_hash
 
 
@@ -125,9 +125,12 @@ def _decision(
     boundary: tuple[str, ...],
     probe: tuple[str, ...],
     effective_at: datetime,
-) -> UniverseDecisionV1:
-    return UniverseDecisionV1(
-        generation=1,
+) -> UniverseDecision:
+    return UniverseDecision(
+        core_generation=1,
+        candidate_revision=0,
+        decision_sequence=1,
+        universe_version="1.0",
         created_at=effective_at,
         effective_at=effective_at,
         reason=UniverseDecisionReason.FORMAL_BOOTSTRAP,

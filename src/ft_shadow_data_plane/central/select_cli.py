@@ -11,7 +11,7 @@ from ft_shadow_data_plane.central.selector import (
     select_bootstrap_universe,
     write_formal_bundle,
 )
-from ft_shadow_data_plane.contracts.models import UniverseDecisionReason, UniverseDecisionV1
+from ft_shadow_data_plane.contracts.models import UniverseDecision, UniverseDecisionReason
 from ft_shadow_data_plane.contracts.serde import universe_hash
 
 
@@ -38,8 +38,11 @@ def main() -> None:
     core = selected.core
     boundary = selected.boundary
     probe = selected.probe
-    decision = UniverseDecisionV1(
-        generation=1,
+    decision = UniverseDecision(
+        core_generation=1,
+        candidate_revision=0,
+        decision_sequence=1,
+        universe_version="1.0",
         created_at=now,
         effective_at=now,
         reason=UniverseDecisionReason.FORMAL_BOOTSTRAP,

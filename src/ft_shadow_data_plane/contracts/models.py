@@ -287,9 +287,11 @@ class GapEventV1(FrozenModel):
         return self
 
 
-class UniverseDecisionV1(FrozenModel):
-    schema_version: Literal[1] = 1
-    generation: int = Field(ge=1)
+class UniverseDecision(FrozenModel):
+    core_generation: int = Field(ge=1)
+    candidate_revision: int = Field(ge=0)
+    decision_sequence: int = Field(ge=1)
+    universe_version: str = Field(pattern=r"^[1-9][0-9]*\.[0-9]+$")
     created_at: datetime
     effective_at: datetime
     reason: UniverseDecisionReason
@@ -328,7 +330,9 @@ class UniverseDecisionV1(FrozenModel):
         return tuple(sorted((*self.core, *self.boundary, *self.probe)))
 
     @model_validator(mode="after")
-    def validate_schedule_and_hash(self) -> UniverseDecisionV1:
+    def validate_schedule_version_and_hash(self) -> UniverseDecision:
+        if self.universe_version != f"{self.core_generation}.{self.candidate_revision}":
+            raise ValueError("universe_version does not match its integer components")
         if self.effective_at < self.created_at:
             raise ValueError("decision cannot be effective before creation")
         all_members = (*self.core, *self.boundary, *self.probe)
@@ -350,9 +354,7 @@ class UniverseDecisionV1(FrozenModel):
         return self
 
 
-class CandidateOverrideV1(FrozenModel):
-    schema_version: Literal[1] = 1
-    generation: int = Field(ge=2)
+class CandidateOverride(FrozenModel):
     created_at: datetime
     effective_at: datetime
     boundary: tuple[str, ...] = Field(min_length=5, max_length=5)
@@ -375,7 +377,7 @@ class CandidateOverrideV1(FrozenModel):
         return normalized
 
     @model_validator(mode="after")
-    def validate_override(self) -> CandidateOverrideV1:
+    def validate_override(self) -> CandidateOverride:
         if self.effective_at < self.created_at:
             raise ValueError("override cannot be effective before creation")
         if any(
@@ -387,8 +389,8 @@ class CandidateOverrideV1(FrozenModel):
             )
         ):
             raise ValueError("candidate override must become effective at 00:00 UTC")
-        if set(self.boundary) & set(self.probe):
-            raise ValueError("candidate override roles must be disjoint")
+        if len(set((*self.boundary, *self.probe))) != 10:
+            raise ValueError("override roles must contain 10 distinct members")
         return self
 
 

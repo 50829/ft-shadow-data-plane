@@ -1,24 +1,32 @@
 from __future__ import annotations
 
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import orjson
 import pytest
 from universe_fixtures import formal_roles, liquidity_snapshot
 
+from ft_shadow_data_plane.central.control_cli import main as control_main
+from ft_shadow_data_plane.contracts.models import UniverseDecision, UniverseDecisionReason
+from ft_shadow_data_plane.contracts.serde import universe_hash
 from ft_shadow_data_plane.edge.config import UniversePolicyConfig
-from ft_shadow_data_plane.edge.universe import UniverseStore
+from ft_shadow_data_plane.edge.universe import UniverseStore, _next_version
 
 EVIDENCE_HASH = "d" * 64
 
 
-def test_clean_store_starts_generation_one_with_research_hash(tmp_path: Path) -> None:
+def test_clean_store_starts_version_one_zero_with_research_hash(tmp_path: Path) -> None:
     now = datetime(2026, 8, 17, 23, 50, tzinfo=UTC)
     store = UniverseStore(tmp_path, _policy())
 
     active = store.initialize(now)
 
-    assert active.generation == 1
+    assert active.universe_version == "1.0"
+    assert active.core_generation == 1
+    assert active.candidate_revision == 0
+    assert active.decision_sequence == 1
     assert (active.core, active.boundary, active.probe) == formal_roles()
     assert active.source_hashes == (EVIDENCE_HASH,)
 
@@ -65,6 +73,73 @@ def test_confirmed_inactive_candidate_is_planned_after_formal_start(
     assert decision is not None
     assert active.boundary[0] not in decision.members
     assert decision.effective_at == datetime(2026, 8, 19, tzinfo=UTC)
+    assert decision.universe_version == "1.1"
+    assert decision.decision_sequence == 2
+
+
+def test_unchanged_members_do_not_create_a_new_version(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 18, 23, 50, tzinfo=UTC)
+    store = UniverseStore(tmp_path, _policy())
+    active = store.initialize(now - timedelta(days=3))
+    (tmp_path / "control/formal-start.json").write_text("{}", encoding="ascii")
+
+    decision = store.observe_and_plan(liquidity_snapshot(now), now=now)
+
+    assert decision is None
+    assert store.active == active
+    assert not (tmp_path / "control/universe/pending.json").exists()
+
+
+def test_core_and_candidate_changes_advance_separate_version_components() -> None:
+    core, boundary, probe = formal_roles()
+    active = UniverseDecision(
+        core_generation=6,
+        candidate_revision=1,
+        decision_sequence=7,
+        universe_version="6.1",
+        created_at=datetime(2026, 8, 21, tzinfo=UTC),
+        effective_at=datetime(2026, 8, 21, tzinfo=UTC),
+        reason=UniverseDecisionReason.DAILY_CANDIDATE,
+        core=core,
+        boundary=boundary,
+        probe=probe,
+        universe_hash=universe_hash(core, boundary, probe),
+    )
+
+    assert _next_version(active, active.core) == (6, 2)
+    changed_core = tuple(sorted((*active.core[1:], active.boundary[0])))
+    assert _next_version(active, changed_core) == (7, 0)
+
+
+def test_candidate_override_cli_leaves_version_allocation_to_edge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _core, boundary, probe = formal_roles()
+    boundary_path = tmp_path / "boundary.txt"
+    probe_path = tmp_path / "probe.txt"
+    output_path = tmp_path / "candidate.override.json"
+    boundary_path.write_text("\n".join(boundary), encoding="ascii")
+    probe_path.write_text("\n".join(probe), encoding="ascii")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "ft-data-control",
+            "--effective-at",
+            "2099-01-01T00:00:00Z",
+            "--boundary-file",
+            str(boundary_path),
+            "--probe-file",
+            str(probe_path),
+            "--output",
+            str(output_path),
+        ],
+    )
+
+    control_main()
+
+    override = orjson.loads(output_path.read_bytes())
+    assert "generation" not in override
 
 
 def _policy() -> UniversePolicyConfig:

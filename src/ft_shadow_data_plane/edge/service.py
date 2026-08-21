@@ -196,18 +196,29 @@ class EdgeService:
                     if self._sources.running:
                         await self._sources.stop()
                 elif self._storage_gap_id is not None:
+                    recovery_ready = True
                     if not self._sources.running:
-                        await self._sources.start(self._universe_store.active.members)
-                        await self._sources.wait_ready()
-                        await self._close_stale_gaps()
-                        await self._seal_completed_days()
-                        await self._mark_formal_start()
-                    await self._gaps.close(
-                        self._storage_gap_id,
-                        GapReason.STORAGE_EXHAUSTED,
-                        exchange_symbols=self._universe_store.active.members,
-                    )
-                    self._storage_gap_id = None
+                        try:
+                            await self._sources.start(self._universe_store.active.members)
+                            await self._sources.wait_ready()
+                        except TimeoutError as exc:
+                            logger.warning(
+                                "storage recovery source readiness failed; will retry error=%r",
+                                exc,
+                            )
+                            await self._sources.stop()
+                            recovery_ready = False
+                        else:
+                            await self._close_stale_gaps()
+                            await self._seal_completed_days()
+                            await self._mark_formal_start()
+                    if recovery_ready:
+                        await self._gaps.close(
+                            self._storage_gap_id,
+                            GapReason.STORAGE_EXHAUSTED,
+                            exchange_symbols=self._universe_store.active.members,
+                        )
+                        self._storage_gap_id = None
             await _wait_event(self._stop, self._config.storage_check_seconds)
 
     async def _midnight_loop(self) -> None:
@@ -278,8 +289,9 @@ class EdgeService:
                     canonical_json_bytes(decision),
                 )
                 logger.info(
-                    "planned universe generation=%d effective_at=%s changed=%d",
-                    decision.generation,
+                    "planned universe version=%s decision_sequence=%d effective_at=%s changed=%d",
+                    decision.universe_version,
+                    decision.decision_sequence,
                     decision.effective_at,
                     len(set(self._universe_store.active.members) ^ set(decision.members)),
                 )
@@ -294,7 +306,10 @@ class EdgeService:
         payload = {
             "event": "FORMAL_COLLECTION_STARTED",
             "experiment_id": self._config.universe.experiment_id,
-            "generation": active.generation,
+            "core_generation": active.core_generation,
+            "candidate_revision": active.candidate_revision,
+            "decision_sequence": active.decision_sequence,
+            "universe_version": active.universe_version,
             "started_at": started_at.isoformat(),
             "universe_hash": active.universe_hash,
         }
@@ -307,9 +322,11 @@ class EdgeService:
             atomic_write_bytes, self._formal_start_path, canonical_json_bytes(payload)
         )
         logger.info(
-            "FORMAL_COLLECTION_STARTED experiment_id=%s generation=%d symbols=60",
+            "FORMAL_COLLECTION_STARTED experiment_id=%s universe_version=%s "
+            "decision_sequence=%d symbols=60",
             self._config.universe.experiment_id,
-            active.generation,
+            active.universe_version,
+            active.decision_sequence,
         )
 
     async def _emit_control_event(self, stream_type: StreamType, payload: bytes) -> None:

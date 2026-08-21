@@ -18,7 +18,7 @@ from ft_shadow_data_plane.contracts.models import (
     ContentType,
     DayManifestV1,
     StreamType,
-    UniverseDecisionV1,
+    UniverseDecision,
 )
 from ft_shadow_data_plane.contracts.schema import RAW_EVENT_SCHEMA_V1
 from ft_shadow_data_plane.contracts.serde import (
@@ -65,7 +65,7 @@ class DayNormalizer:
         chunk_manifests = self._load_chunk_manifests(day_manifest)
         deduplicator = _Deduplicator.load(self._previous_dedup_checkpoint())
         formal_starts: list[tuple[int, dict[str, Any], str]] = []
-        universe_events: list[tuple[UniverseDecisionV1, str]] = []
+        universe_events: list[tuple[UniverseDecision, str]] = []
         raw_count = 0
         typed_count = 0
         duplicate_count = 0
@@ -97,7 +97,7 @@ class DayNormalizer:
                             )
                         )
                     elif stream_type is StreamType.UNIVERSE_DECISION:
-                        decision = UniverseDecisionV1.model_validate_json(
+                        decision = UniverseDecision.model_validate_json(
                             bytes(raw_row["payload_bytes"])
                         )
                         universe_events.append((decision, manifest.universe_hash))
@@ -150,7 +150,18 @@ class DayNormalizer:
             "expected_symbols": (
                 list(active_universe.members) if active_universe is not None else None
             ),
-            "generation": (active_universe.generation if active_universe is not None else None),
+            "core_generation": (
+                active_universe.core_generation if active_universe is not None else None
+            ),
+            "candidate_revision": (
+                active_universe.candidate_revision if active_universe is not None else None
+            ),
+            "decision_sequence": (
+                active_universe.decision_sequence if active_universe is not None else None
+            ),
+            "universe_version": (
+                active_universe.universe_version if active_universe is not None else None
+            ),
             "universe_hash": (
                 active_universe.universe_hash if active_universe is not None else None
             ),
@@ -162,8 +173,8 @@ class DayNormalizer:
 
     @staticmethod
     def _active_universe(
-        events: list[tuple[UniverseDecisionV1, str]], *, at_ns: int
-    ) -> UniverseDecisionV1 | None:
+        events: list[tuple[UniverseDecision, str]], *, at_ns: int
+    ) -> UniverseDecision | None:
         candidates = [
             (decision, chunk_universe_hash)
             for decision, chunk_universe_hash in events
@@ -173,7 +184,10 @@ class DayNormalizer:
             return None
         decision, chunk_universe_hash = max(
             candidates,
-            key=lambda item: (item[0].generation, item[0].effective_at),
+            key=lambda item: (
+                item[0].decision_sequence,
+                item[0].effective_at,
+            ),
         )
         if decision.universe_hash != chunk_universe_hash:
             raise ValueError("active universe event/chunk hash mismatch")
@@ -352,12 +366,20 @@ def _formal_start_payload(raw: bytes) -> dict[str, Any]:
         raise ValueError("invalid formal collection start event")
     if not isinstance(value.get("experiment_id"), str) or not value["experiment_id"]:
         raise ValueError("formal start has no experiment ID")
-    if (
-        not isinstance(value.get("generation"), int)
-        or isinstance(value["generation"], bool)
-        or value["generation"] < 1
+    integer_fields = ("core_generation", "candidate_revision", "decision_sequence")
+    if any(
+        not isinstance(value.get(field), int) or isinstance(value[field], bool)
+        for field in integer_fields
     ):
-        raise ValueError("formal start has an invalid generation")
+        raise ValueError("formal start has invalid structured universe version fields")
+    if (
+        value["core_generation"] < 1
+        or value["candidate_revision"] < 0
+        or value["decision_sequence"] < 1
+        or value.get("universe_version")
+        != f'{value["core_generation"]}.{value["candidate_revision"]}'
+    ):
+        raise ValueError("formal start has an invalid structured universe version")
     if not isinstance(value.get("universe_hash"), str):
         raise ValueError("formal start has no universe hash")
     try:
@@ -370,12 +392,19 @@ def _formal_start_payload(raw: bytes) -> dict[str, Any]:
 
 
 def _validate_formal_start(
-    evidence: tuple[int, dict[str, Any], str], active: UniverseDecisionV1
+    evidence: tuple[int, dict[str, Any], str], active: UniverseDecision
 ) -> None:
     _observed_ns, payload, chunk_universe_hash = evidence
-    if (
-        payload["generation"] != active.generation
-        or payload["universe_hash"] != active.universe_hash
+    version_matches = all(
+        (
+            payload.get("core_generation") == active.core_generation,
+            payload.get("candidate_revision") == active.candidate_revision,
+            payload.get("decision_sequence") == active.decision_sequence,
+            payload.get("universe_version") == active.universe_version,
+        )
+    )
+    if not version_matches or (
+        payload["universe_hash"] != active.universe_hash
         or chunk_universe_hash != active.universe_hash
     ):
         raise ValueError("formal start/universe identity mismatch")

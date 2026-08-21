@@ -1,6 +1,6 @@
 from ft_shadow_data_plane.contracts.models import (
     AckV1,
-    CandidateOverrideV1,
+    CandidateOverride,
     ChunkManifestV1,
     ChunkRefV1,
     DatasetReleaseV1,
@@ -11,13 +11,13 @@ from ft_shadow_data_plane.contracts.models import (
     GapState,
     RawEventV1,
     StreamType,
+    UniverseDecision,
     UniverseDecisionReason,
-    UniverseDecisionV1,
 )
 
 __all__ = [
     "AckV1",
-    "CandidateOverrideV1",
+    "CandidateOverride",
     "ChunkManifestV1",
     "ChunkRefV1",
     "DatasetReleaseV1",
@@ -28,6 +28,6 @@ __all__ = [
     "GapState",
     "RawEventV1",
     "StreamType",
+    "UniverseDecision",
     "UniverseDecisionReason",
-    "UniverseDecisionV1",
 ]

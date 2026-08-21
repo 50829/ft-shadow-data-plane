@@ -24,8 +24,9 @@ class OnlineSources:
 
 
 class StorageSources:
-    def __init__(self, *, running: bool) -> None:
+    def __init__(self, *, running: bool, ready_error: BaseException | None = None) -> None:
         self.running = running
+        self.ready_error = ready_error
         self.start_calls = 0
         self.stop_calls = 0
         self.ready_calls = 0
@@ -45,6 +46,8 @@ class StorageSources:
 
     async def wait_ready(self) -> None:
         self.ready_calls += 1
+        if self.ready_error is not None:
+            raise self.ready_error
 
 
 class StorageSpool:
@@ -202,6 +205,41 @@ async def test_existing_storage_gap_stops_sources_when_limit_is_still_hard() -> 
     assert service._storage_gap_id == "gap-stale"
 
 
+@pytest.mark.asyncio
+async def test_storage_recovery_readiness_timeout_remains_retryable() -> None:
+    service = _storage_service(
+        SpoolStatus(used_bytes=100, free_bytes=1_000, hard_limited=False),
+        sources_running=False,
+        storage_gap_id="gap-stale",
+        ready_error=TimeoutError("sources did not become ready"),
+    )
+
+    await service._storage_loop()
+
+    assert service._sources.start_calls == 1
+    assert service._sources.ready_calls == 1
+    assert service._sources.stop_calls == 1
+    assert service._sources.running is False
+    assert service._gaps.closed == []
+    assert service._storage_gap_id == "gap-stale"
+
+
+@pytest.mark.asyncio
+async def test_storage_recovery_source_failure_remains_fatal() -> None:
+    service = _storage_service(
+        SpoolStatus(used_bytes=100, free_bytes=1_000, hard_limited=False),
+        sources_running=False,
+        storage_gap_id="gap-stale",
+        ready_error=RuntimeError("source group failed"),
+    )
+
+    with pytest.raises(RuntimeError, match="source group failed"):
+        await service._storage_loop()
+
+    assert service._gaps.closed == []
+    assert service._storage_gap_id == "gap-stale"
+
+
 def _service(previous: object, decision: object | None) -> Any:
     service: Any = object.__new__(EdgeService)
     service._sources = OnlineSources()
@@ -227,11 +265,12 @@ def _storage_service(
     *,
     sources_running: bool,
     storage_gap_id: str | None,
+    ready_error: BaseException | None = None,
 ) -> Any:
     service: Any = object.__new__(EdgeService)
     service._stop = asyncio.Event()
     service._operation_lock = asyncio.Lock()
-    service._sources = StorageSources(running=sources_running)
+    service._sources = StorageSources(running=sources_running, ready_error=ready_error)
     service._spool = StorageSpool(status, service._stop)
     service._gaps = StorageGaps()
     service._storage_gap_id = storage_gap_id

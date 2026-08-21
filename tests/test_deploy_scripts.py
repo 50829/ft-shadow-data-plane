@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -9,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from ft_shadow_data_plane.contracts.serde import universe_hash
 from ft_shadow_data_plane.edge.binance import shard_instruments
 from ft_shadow_data_plane.edge.config import load_edge_config
 
@@ -48,6 +50,35 @@ def test_vultr_config_is_formal_sixty_and_memory_bounded() -> None:
         5,
     )
     assert len(config.universe.members) == 60
+    assert (
+        config.universe.core_generation,
+        config.universe.candidate_revision,
+        config.universe.decision_sequence,
+    ) == (6, 2, 8)
+    assert universe_hash(
+        config.universe.core,
+        config.universe.boundary,
+        config.universe.probe,
+    ) == "439258f232c9cd174bc1a3900ea3802c3bc3f3e78381be620732dbd3de96a94c"
+    evidence = PROJECT_ROOT / "docs/formal-universe-6.2-evidence.json"
+    assert hashlib.sha256(evidence.read_bytes()).hexdigest() == (
+        config.universe.bootstrap_evidence_sha256
+    )
+    frozen = json.loads(evidence.read_bytes())
+    assert (
+        frozen["core_generation"],
+        frozen["candidate_revision"],
+        frozen["decision_sequence"],
+        frozen["universe_version"],
+    ) == (6, 2, 8, "6.2")
+    assert tuple(frozen["core"]) == config.universe.core
+    assert tuple(frozen["boundary"]) == config.universe.boundary
+    assert tuple(frozen["probe"]) == config.universe.probe
+    assert frozen["universe_hash"] == universe_hash(
+        tuple(frozen["core"]),
+        tuple(frozen["boundary"]),
+        tuple(frozen["probe"]),
+    )
     assert config.public_connection_shards == 4
     shard_sizes = sorted(
         len(shard)
@@ -56,7 +87,8 @@ def test_vultr_config_is_formal_sixty_and_memory_bounded() -> None:
             config.public_connection_shards,
         )
     )
-    assert shard_sizes == [14, 14, 14, 18]
+    assert sum(shard_sizes) == 60
+    assert max(shard_sizes) <= 18
     assert (max(shard_sizes) - 1) * config.snapshot_request_interval_seconds <= 34
     assert config.queue_max_bytes == 64 * 1024**2
     assert config.websocket_max_queue == 4

@@ -15,8 +15,8 @@ from ft_shadow_data_plane.contracts.models import (
     DayManifestV1,
     RawEventV1,
     StreamType,
+    UniverseDecision,
     UniverseDecisionReason,
-    UniverseDecisionV1,
 )
 from ft_shadow_data_plane.contracts.schema import raw_events_to_table
 from ft_shadow_data_plane.contracts.serde import (
@@ -76,8 +76,11 @@ def test_normalizer_binds_formal_window_to_raw_universe_evidence(tmp_path: Path)
     probe = tuple(f"P{index:03}USDT" for index in range(5))
     active_hash = universe_hash(core, boundary, probe)
     effective_at = datetime(2026, 8, 10, tzinfo=UTC)
-    decision = UniverseDecisionV1(
-        generation=1,
+    decision = UniverseDecision(
+        core_generation=6,
+        candidate_revision=2,
+        decision_sequence=8,
+        universe_version="6.2",
         created_at=effective_at,
         effective_at=effective_at,
         reason=UniverseDecisionReason.FORMAL_BOOTSTRAP,
@@ -102,8 +105,11 @@ def test_normalizer_binds_formal_window_to_raw_universe_evidence(tmp_path: Path)
             payload=orjson.dumps(
                 {
                     "event": "FORMAL_COLLECTION_STARTED",
-                    "experiment_id": "formal-v1",
-                    "generation": 1,
+                    "experiment_id": "formal-current",
+                    "core_generation": 6,
+                    "candidate_revision": 2,
+                    "decision_sequence": 8,
+                    "universe_version": "6.2",
                     "started_at": "2026-08-10T12:00:00+00:00",
                     "universe_hash": active_hash,
                 }
@@ -130,7 +136,12 @@ def test_normalizer_binds_formal_window_to_raw_universe_evidence(tmp_path: Path)
     assert marker["collection_window_start_ns"] == formal_start_ns
     assert marker["expected_symbols"] == list(decision.members)
     assert marker["universe_hash"] == active_hash
-    assert marker["formal_start_experiment_id"] == "formal-v1"
+    assert marker["schema_version"] == 1
+    assert marker["core_generation"] == 6
+    assert marker["candidate_revision"] == 2
+    assert marker["decision_sequence"] == 8
+    assert marker["universe_version"] == "6.2"
+    assert marker["formal_start_experiment_id"] == "formal-current"
 
 
 def test_normalizer_rejects_formal_start_universe_mismatch(tmp_path: Path) -> None:
@@ -139,8 +150,11 @@ def test_normalizer_rejects_formal_start_universe_mismatch(tmp_path: Path) -> No
     probe = tuple(f"P{index:03}USDT" for index in range(5))
     active_hash = universe_hash(core, boundary, probe)
     effective_at = datetime(2026, 8, 10, tzinfo=UTC)
-    decision = UniverseDecisionV1(
-        generation=1,
+    decision = UniverseDecision(
+        core_generation=6,
+        candidate_revision=2,
+        decision_sequence=8,
+        universe_version="6.2",
         created_at=effective_at,
         effective_at=effective_at,
         reason=UniverseDecisionReason.FORMAL_BOOTSTRAP,
@@ -164,8 +178,11 @@ def test_normalizer_rejects_formal_start_universe_mismatch(tmp_path: Path) -> No
             payload=orjson.dumps(
                 {
                     "event": "FORMAL_COLLECTION_STARTED",
-                    "experiment_id": "formal-v1",
-                    "generation": 1,
+                    "experiment_id": "formal-current",
+                    "core_generation": 6,
+                    "candidate_revision": 2,
+                    "decision_sequence": 8,
+                    "universe_version": "6.2",
                     "started_at": "2026-08-10T12:00:00+00:00",
                     "universe_hash": "f" * 64,
                 }

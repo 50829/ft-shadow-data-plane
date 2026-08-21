@@ -178,7 +178,10 @@ def _write_day_outputs(
                 "expected_symbols": list(symbols),
                 "collection_window_start_ns": day_start_ns,
                 "collection_window_end_ns": day_end_ns,
-                "generation": 1,
+                "core_generation": 1,
+                "candidate_revision": 0,
+                "decision_sequence": 1,
+                "universe_version": "1.0",
                 "universe_hash": "a" * 64,
                 "sealed_manifest_sha256": "b" * 64,
             }

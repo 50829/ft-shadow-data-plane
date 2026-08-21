@@ -18,6 +18,9 @@ class UniversePolicyConfig(BaseModel):
 
     experiment_id: str = Field(min_length=8, max_length=160)
     bootstrap_evidence_sha256: str
+    core_generation: int = Field(default=1, ge=1)
+    candidate_revision: int = Field(default=0, ge=0)
+    decision_sequence: int = Field(default=1, ge=1)
     core: tuple[str, ...] = Field(min_length=50, max_length=50)
     boundary: tuple[str, ...] = Field(min_length=5, max_length=5)
     probe: tuple[str, ...] = Field(min_length=5, max_length=5)

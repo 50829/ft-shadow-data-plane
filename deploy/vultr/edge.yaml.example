@@ -1,8 +1,11 @@
 collector_id: tokyo01
 data_root: /data
 universe:
-  experiment_id: formal-60-v2-2026-08-12
-  bootstrap_evidence_sha256: c77498c9be3ae0547c983db06d166ac9711945067aaa7ac4a7bf6623dbd65910
+  experiment_id: formal-60-v3-2026-08-22
+  bootstrap_evidence_sha256: d1eb8664c9636c78627e9768b4c874594bd48a31f3fdc115476788368207abf0
+  core_generation: 6
+  candidate_revision: 2
+  decision_sequence: 8
   core:
     - 1000BONKUSDT
     - 1000PEPEUSDT
@@ -55,16 +58,16 @@ universe:
     - XRPUSDT
     - ZECUSDT
   boundary:
-    - APTUSDT
-    - ETCUSDT
-    - LDOUSDT
+    - ACEUSDT
+    - CRVUSDT
+    - HOMEUSDT
+    - SKYAIUSDT
     - WLFIUSDT
-    - ZAMAUSDT
   probe:
     - CAPUSDT
-    - ESPUSDT
-    - REUSDT
-    - SLXUSDT
+    - CYSUSDT
+    - DOSUSDT
+    - GRVTUSDT
     - XAUTUSDT
   automation_enabled: true
   discovery_hour_utc: 23
