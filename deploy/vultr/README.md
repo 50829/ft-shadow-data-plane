@@ -1,6 +1,6 @@
 # Vultr 正式采集部署
 
-本手册适用于 `167.179.115.243` 上的 v0.3.4 collector。数据根为
+本手册适用于 `167.179.115.243` 上的 v0.3.5 collector。数据根为
 `/srv/ft-data-rsync`，collector 和受限传输账户都使用 UID/GID 10001。
 
 ## 1. 前置条件
@@ -19,7 +19,7 @@ timedatectl status
 
 ## 2. 安装目录和服务
 
-在 v0.3.4 仓库根目录执行：
+在 v0.3.5 仓库根目录执行：
 
 ```bash
 sudo ./deploy/vultr/install.sh
@@ -69,7 +69,7 @@ ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
 
 ## 4. 配置正式 60 币和镜像
 
-`/etc/ft-shadow-data-plane/edge.yaml` 必须使用仓库 v0.3.4 示例。核对三个角色为 50/5/5、
+`/etc/ft-shadow-data-plane/edge.yaml` 必须使用仓库 v0.3.5 示例。核对三个角色为 50/5/5、
 `bootstrap_evidence_sha256` 与正式报告一致、`automation_enabled: true`、public shards 为 4，
 queue 为 64MiB。不要加入旧字段。
 
@@ -93,9 +93,11 @@ docker image inspect "$EDGE_IMAGE" --format '{{json .RepoDigests}}'
 
 Compose 已固定 0.90 CPU、768MiB RAM、256 PIDs、只读 rootfs 和日志轮换。
 
-## 5. v0.3.4 clean start
+## 5. v0.3.5 clean start
 
-只有在确认旧数据无需保留时执行。以下删除不可恢复，目标必须逐项等于显示值：
+只有在 collector 已停止、107 已经拉到 `new_chunks=0 failures=0`，且旧 control/evidence/gap tar
+已传到 107 并通过 SHA-256 校验后执行。Vultr 容量不足以长期保留第二份 spool，因此远端 active
+路径会重置，但旧实验的唯一归档保留在 107。以下删除不可恢复，目标必须逐项等于显示值：
 
 ```bash
 sudo systemctl stop ft-shadow-data-plane.service || true
@@ -137,11 +139,11 @@ journalctl -u ft-shadow-data-plane.service -f
 只有出现以下日志后才进入正式时间范围：
 
 ```text
-FORMAL_COLLECTION_STARTED ... generation=<current> symbols=60
+FORMAL_COLLECTION_STARTED ... universe_version=<major.revision> decision_sequence=<n> symbols=60
 ```
 
 clean start 时 collector 会用最新 14 个完整 UTC 日、5 次 bookTicker 和 3 次 depth 验证冻结的
-generation 1；保状态升级必须保持部署前的 current generation 和 universe hash。
+`6.2 / sequence 8`；初始化不会读取任何旧 active、pending 或 generation 文件。
 若两次状态请求发现非交易合约，或任何已配置成员跌破角色硬门槛，它会拒绝写正式标记并退出。
 合格池内部因瞬时盘口产生的排名变化不会改写冻结名单。失败时必须重新冻结证据和配置，再执行
 clean start；不要绕过检查或减少总数。
@@ -150,7 +152,8 @@ clean start；不要绕过检查或减少总数。
 
 ```bash
 sudo test -s /srv/ft-data-rsync/control/formal-start.json
-sudo jq '{generation,core,boundary,probe,universe_hash}' \
+sudo jq '{core_generation,candidate_revision,decision_sequence,universe_version,
+          core,boundary,probe,universe_hash}' \
   /srv/ft-data-rsync/control/universe/active.json
 sudo find /srv/ft-data-rsync/ready -type f | head
 ```
@@ -170,7 +173,7 @@ journalctl -u ft-shadow-data-plane.service --since '24 hours ago' \
 ```
 
 `control/universe/observations` 保存每日增量 Kline 和盘口证据，`evaluations` 保存 stable/probe
-池数量与每次评估，`decisions` 保存实际 generation。stable 池小于 65 会报警。正常日切没有
+池数量与每次评估，`decisions` 保存实际 decision。stable 池小于 65 会报警。正常日切没有
 成员变化时不会出现计划 gap；若发生替换，gap 只应列出移除和新增币。
 
 正式完整性参数为：public stream 30 秒、`markPrice@1s` 5 秒、订阅集合审计 60 秒且响应 deadline
@@ -232,3 +235,8 @@ sudo find /srv/ft-data-rsync/control/open-gaps -maxdepth 1 -type f -print
 `control/open-gaps`。新容器完整 ready 后，遗留 `STORAGE_EXHAUSTED_GAP` 和
 `COLLECTOR_STOPPED_GAP` 应自动关闭，`sources already running` 不得再次出现。继续观察至少两个
 collector status 周期，并确认 ready chunk 和 107 ACK 均持续推进。107 不需要升级。
+
+从 v0.3.4 升级 v0.3.5 不做状态迁移。按
+[clean start 手册](../../docs/v0.3.5-structured-universe-clean-start.md) 先把所有 ready 拉到 107，
+再归档 107 旧 raw/runtime 和 Vultr 旧 control/evidence/gap。只有归档验证完成后才清空 Vultr active
+数据路径，以新配置直接启动 `6.2 / sequence 8`。代码不读取旧 generation 文件。

@@ -1,6 +1,6 @@
 # ft-shadow-data-plane
 
-Binance USD-M 正式数据采集与重建流水线。v0.3.4 从 generation 1 直接采集 60 个合约：
+Binance USD-M 正式数据采集与重建流水线。v0.3.5 持续采集 60 个合约：
 50 core、5 boundary、5 probe。
 
 ```text
@@ -14,7 +14,8 @@ Vultr 负责采集、完整 UTC 日流动性证据、排名和增量换币。107
 ACK 和 Slurm 处理，不参与选币。成员不变的 UTC 日切不会停止数据源；替换一个币只在线更新
 这个币涉及的订阅和 OI 任务，其余 59 个币保持在线。
 
-正式名单证据见 [generation 1 决策](docs/bootstrap-liquidity-decision-2026-08-12.md)，规则、
+当前 `6.2` 正式名单证据见
+[结构化 universe clean start](docs/v0.3.5-structured-universe-clean-start.md)，规则、
 边界语义和性能标准见 [实施合同](docs/implementation-plan.md)。部署入口：
 
 - [Vultr 正式采集部署](deploy/vultr/README.md)
@@ -51,3 +52,11 @@ v0.3.4 修复持久化 `STORAGE_EXHAUSTED_GAP` 跨进程恢复时重复启动 Bi
 存储硬限制仍会先登记 gap 再暂停采集，空间恢复后只启动一次 sources，并在完整 readiness 后关闭 gap。
 107 协议和数据合同没有变化。事故边界和升级要求见
 [v0.3.4 存储恢复事故记录](docs/v0.3.4-storage-recovery-incident-2026-08-20.md)。
+
+v0.3.5 将 universe 身份拆成 `core_generation.candidate_revision`：50 个 core 变化才增加
+`core_generation` 并把 revision 归零，仅 boundary/probe 变化只增加 revision，成员完全不变不产生
+新版本。两个分量均为整数，`decision_sequence` 提供全序，`universe_hash` 继续绑定精确 50/5/5。
+本版本还修复 storage recovery 等待 source readiness 超时会终止 collector 的问题；超时后保持
+storage gap OPEN、清理半启动 sources，并在下一轮重试。旧 generation 数据只归档、不混入新
+数据路径；运行时代码不含兼容层。部署边界见
+[v0.3.5 结构化 universe clean start](docs/v0.3.5-structured-universe-clean-start.md)。

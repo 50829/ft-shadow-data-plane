@@ -23,43 +23,60 @@ module -t avail 2>&1 | grep apptainer
 command -v crontab flock sbatch ssh
 ```
 
-新装时使用 v0.3.4 的仓库目录、`ft-shadow-data-plane.sif`、对应 SHA-256 文件，以及 Vultr 已授权的
+新装时使用 v0.3.5 的仓库目录、`ft-shadow-data-plane.sif`、对应 SHA-256 文件，以及 Vultr 已授权的
 `~/.ssh/ft-data-puller` 私钥。
 
-v0.3.4 只修改 edge 存储恢复路径，没有修改 107 的 pull、central 派生处理或 raw schema。已经安装
-v0.3.1、v0.3.2 或 v0.3.3 的 107 不需要为接收 v0.3.4 raw 而升级；继续保持 cron 即可。
+v0.3.5 只支持当前结构化 universe 合同，不解析旧 generation。旧 raw/runtime 原地移动到
+`data/archive/pre-v0.3.5-*`，不删除；新 runtime/raw/derived 从空路径部署，禁止把旧文件混入新日期。
 
-## 2. clean start
+## 2. 归档旧实验并 clean start
 
-先从 `crontab -e` 删除旧 pull 行，再确认没有正在运行的 pull：
+先在 Vultr 停止 collector，使 `writing` 完成封口。然后在 107 备份 crontab，并从
+`crontab -e` 删除旧 pull 行：
 
 ```bash
+BASE=/home/scc/pb24000367/Projects/bn
+crontab -l > "$BASE/crontab.pre-v0.3.5"
+crontab -e
 pgrep -af ft-data-pull || true
 ```
 
-用户已明确不保留旧 runtime/raw/derived 时，先逐项解析：
+等待现有 pull 退出后，手工运行旧 `pull-once.sh`，直到连续一次出现
+`pull complete new_chunks=0 failures=0`。这一步必须在归档前完成，不能只看本地文件大小。
+
+从 Vultr 导出的旧 control/evidence/gap tar 传到 107 后，为旧实验创建时间戳 archive。以下操作
+全部是同一文件系统内的 rename，不复制或删除旧 raw：
 
 ```bash
-for path in \
-  /home/scc/pb24000367/Projects/bn/runtime \
-  /home/scc/pb24000367/Projects/bn/data/raw \
-  /home/scc/pb24000367/Projects/bn/data/derived
-do
-  readlink -f "$path"
-done
+BASE=/home/scc/pb24000367/Projects/bn
+ARCHIVE="$BASE/data/archive/pre-v0.3.5-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$ARCHIVE"
+
+find "$BASE/data/raw" -type f -printf '%s\n' | awk \
+  '{files += 1; bytes += $1} END {printf "raw_files=%d raw_bytes=%.0f\n", files, bytes}' \
+  > "$ARCHIVE/inventory.txt"
+find "$BASE/data/raw" -type f -path '*/date=*/*' -printf '%p\n' \
+  | sed -n 's#.*date=\([^/]*\)/.*#\1#p' | sort -u \
+  >> "$ARCHIVE/inventory.txt"
+
+mv "$BASE/data/raw" "$ARCHIVE/raw"
+mv "$BASE/data/derived" "$ARCHIVE/derived"
+mv "$BASE/runtime" "$ARCHIVE/runtime"
 ```
 
-人工核对后只删除上述三个目标。删除不可恢复，不要删除仓库和 `~/.ssh`：
+把 `vultr-pre-v0.3.5-control.tar.gz` 及其 SHA-256 文件放入同一 `$ARCHIVE`，执行
+`sha256sum --check`。再记录 release、文件数、字节数和日期范围，最后将 archive 设为只读：
 
 ```bash
-rm -rf -- \
-  /home/scc/pb24000367/Projects/bn/runtime \
-  /home/scc/pb24000367/Projects/bn/data/raw \
-  /home/scc/pb24000367/Projects/bn/data/derived
-mkdir -p /home/scc/pb24000367/Projects/bn/data
+(cd "$ARCHIVE" && sha256sum --check vultr-pre-v0.3.5-control.tar.gz.sha256)
+chmod -R a-w "$ARCHIVE"
+mkdir -p "$BASE/data/raw" "$BASE/data/derived"
 ```
 
-## 3. 校验并安装 v0.3.4
+新代码不扫描 `$BASE/data/archive`。旧数据需要旧版离线环境时，必须显式指向该 archive；不得把它
+链接回新的 `data/raw` 或 runtime。
+
+## 3. 校验并安装 v0.3.5
 
 ```bash
 cd /home/scc/pb24000367/Projects/bn/ft-shadow-data-plane
@@ -74,6 +91,28 @@ FT_APPTAINER=/public/app/apptainer/1.4.5/bin/apptainer \
 安装器创建 hash-named SIF 和 sandbox，并令
 `runtime/ft-shadow-data-plane.sandbox` 指向当前版本。构建约占 306MiB，只在新 hash 首次安装
 时执行。`runtime/pull-once.sh` 安装为可执行文件。
+
+归档后旧 runtime 已经不存在，并且 cron 尚未恢复，因此直接安装，不要对不存在的旧
+`runtime/pull.lock` 加锁：
+
+```bash
+BASE=/home/scc/pb24000367/Projects/bn
+cd "$BASE/ft-shadow-data-plane"
+sha256sum --check ft-shadow-data-plane.sif.sha256
+
+FT_CAMPUS_ROOT="$BASE/runtime" \
+FT_DATA_ROOT="$BASE/data" \
+FT_APPTAINER=/public/app/apptainer/1.4.5/bin/apptainer \
+  ./deploy/campus-107/install.sh ./ft-shadow-data-plane.sif
+
+FT_CAMPUS_ROOT="$BASE/runtime" \
+  "$BASE/runtime/deploy/campus-107/verify.sh"
+"$BASE/runtime/pull-once.sh"
+```
+
+详细归档、停 cron 和恢复顺序见
+[`v0.3.5` clean start](../../docs/v0.3.5-structured-universe-clean-start.md)。安装完成后重新安装 cron，
+不得复用 archive 中的 runtime 配置或 sandbox。
 
 ## 4. SSH host key 与 rsync
 
@@ -204,7 +243,8 @@ sacct -j <job-id> --format=JobID,State,Elapsed,MaxRSS,ExitCode
 `_QUALITY_REJECTED.json`。成功后可检查：
 
 ```bash
-jq '{generation,universe_hash,quality_policy,minimum_l2_valid_ratio}' \
+jq '{core_generation,candidate_revision,decision_sequence,universe_version,
+     universe_hash,quality_policy,minimum_l2_valid_ratio}' \
   /home/scc/pb24000367/Projects/bn/data/derived/quality/collector=tokyo01/date=2026-08-12/_PROCESSED.json
 ```
 

@@ -1,9 +1,9 @@
-# v0.3.4 正式采集实施合同
+# v0.3.5 正式采集实施合同
 
 ## 本阶段目标
 
-本版本就是正式实验采集版本。新数据从空状态启动，不读取、转换或迁移 v0.1 的 universe
-状态和 raw 数据。generation 1 一次启动全部 60 个合约；不存在分级扩容配置。
+本版本就是正式实验采集版本。新数据从空的 active 路径启动，不读取、转换或迁移旧 generation
+状态和 raw 数据；旧数据保存在隔离 archive。`6.2` 一次启动全部 60 个合约，不存在分级扩容配置。
 
 Vultr 是 universe 决策者和执行者。107 仅拉取 immutable raw chunk、完成哈希校验、回传
 ACK，并把重计算提交给 Slurm。正式采集过程中不依赖 GitHub，也不依赖 107 回传选币决策。
@@ -15,7 +15,7 @@ ACK，并把重计算提交给 Slurm。正式采集过程中不依赖 GitHub，�
 - `probe` 固定 5 个槽位，代表最新上市的合格永续合约；
 - 三个角色始终互斥，总数始终等于 60。
 
-新 generation 1 由 [14 日官方证据](bootstrap-liquidity-decision-2026-08-12.md) 冻结。首次
+新 `6.2` 由 [冻结证据](formal-universe-6.2-evidence.json) 记录，并在首次
 启动必须用新的双重状态、14 日 Kline 和盘口证据验证已冻结的 50/5/5 全部仍通过角色硬门槛，
 并同时绑定离线 evidence hash 与实时 source hashes。任何成员失效或不再合格就拒绝写正式
 起点；瞬时盘口导致的合格成员内部排名变化不会擅自改写冻结名单。
@@ -52,8 +52,12 @@ core 只在周一 `00:00 UTC` 评估：
 合格 stable 池少于 65 时报警。任何角色候选不足都 fail closed：保留当前采集、记录评估并
 报警，不自动放宽门槛、不产出少于 60 个成员的 decision。
 
-每次评估都写 evaluation。成员变化时写带 generation、角色、证据 hash、原因、
-`effective_at` 和 `universe_hash` 的 decision。`automation_enabled: false` 可暂停自动决策；
+每次评估都写 evaluation。成员变化时写带结构化 universe 版本、角色、证据 hash、原因、
+`effective_at` 和 `universe_hash` 的 decision。版本不是浮点数：50 个 core 变化时
+`core_generation += 1` 且 `candidate_revision = 0`；仅 boundary/probe 变化时只执行
+`candidate_revision += 1`；成员完全不变不写 decision。`decision_sequence` 对所有实际 decision
+单调加一并用于排序，`universe_version` 只是 `<core_generation>.<candidate_revision>` 展示字符串，
+`universe_hash` 仍绑定精确 50/5/5 身份。`automation_enabled: false` 可暂停自动决策；
 手工 override 只能修改 boundary/probe，不能直接修改 core。
 
 ## 日切和 gap
@@ -92,7 +96,7 @@ collector 每 30 秒写 lease；若上次启动没有 clean shutdown，下次启
 4. discovery 和 clock 首次请求。
 
 随后写入 raw `universe_decision` 和 `FORMAL_COLLECTION_STARTED` 事件，强制 finalize writer，
-再持久化 `control/formal-start.json`。generation 1 决策在写入前必须绑定上述双重状态响应和
+再持久化 `control/formal-start.json`。`6.2` 决策在写入前必须绑定上述双重状态响应和
 ticker 响应的 SHA-256。该事件时间之后的数据属于正式实验。24 小时资源观察是生产监控，
 不会清空或重启已经采集的数据。
 
@@ -150,7 +154,7 @@ formal start 所在 partial day 开始按 UTC 日期顺序处理，不能跳日�
 
 ## 日质量与去重合同
 
-normalizer 从 sealed raw 的 `UNIVERSE_DECISION` 提取权威 generation、universe hash 和恰好 60 个
+normalizer 从 sealed raw 的 `UNIVERSE_DECISION` 提取权威结构化版本、universe hash 和恰好 60 个
 成员。107 的 symbol 文件只是提交参数，必须恰好 60 个唯一大写 symbol，且 finalize 会再次要求它与
 raw 权威集合完全一致，不能靠少传 symbol 缩小验收范围。
 
@@ -160,7 +164,7 @@ raw 权威集合完全一致，不能靠少传 symbol 缩小验收范围。
 - `valid_ratio >= 99.9%`；显式 gap 仍保留在分母中；
 - `accounted_ratio == 100%` 且 `unclassified_ns == 0`；
 - VALID 与 explicit invalid 没有重叠，即 `conflicting_ns == 0`；
-- checkpoint、sealed manifest hash、generation、universe hash 和 60 币 identity 全部一致。
+- checkpoint、sealed manifest hash、结构化 universe 版本、universe hash 和 60 币 identity 全部一致。
 
 不满足时写 `_QUALITY_REJECTED.json`，不得写成功 marker。normalizer 用 10 分钟有界 identity 状态标记
 连接 overlap replay，并通过 `_DEDUP_CHECKPOINT.json` 跨午夜继承；raw 与 typed 保留重复行供审计，
