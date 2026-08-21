@@ -60,6 +60,9 @@ for relative_path in \
     writing \
     control \
     control/acks \
+    control/applying-acks \
+    control/rejected-acks \
+    control/transfer-ledger \
     control/universe
 do
     install -d \

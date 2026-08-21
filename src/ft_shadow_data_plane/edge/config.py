@@ -130,7 +130,7 @@ class UniversePolicyConfig(BaseModel):
 class EdgeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    collector_id: str = Field(min_length=1, max_length=100)
+    collector_id: str = Field(pattern=r"^[A-Za-z0-9._-]{1,100}$")
     data_root: Path
     universe: UniversePolicyConfig
     public_ws_url: str
@@ -162,7 +162,7 @@ class EdgeConfig(BaseModel):
     writer_batch_events: int = Field(default=2_000, ge=100)
     writer_batch_bytes: int = Field(default=2 * 1024**2, ge=64 * 1024)
     spool_max_bytes: int = Field(default=10 * 1024**3, ge=1024**3)
-    minimum_free_bytes: int = Field(default=5 * 1024**3, ge=1024**3)
+    minimum_free_bytes: int = Field(default=2 * 1024**3, ge=1024**3)
     storage_check_seconds: int = Field(default=5, ge=1, le=60)
     d0_enabled: bool = False
     log_level: str = "INFO"

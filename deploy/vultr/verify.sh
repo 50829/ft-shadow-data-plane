@@ -49,7 +49,16 @@ case "$EDGE_IMAGE" in
         ;;
 esac
 
-for relative_path in ready writing control control/acks control/universe; do
+for relative_path in \
+    ready \
+    writing \
+    control \
+    control/acks \
+    control/applying-acks \
+    control/rejected-acks \
+    control/transfer-ledger \
+    control/universe
+do
     if [ ! -d "$EDGE_DATA_ROOT/$relative_path" ]; then
         echo "missing data directory: $EDGE_DATA_ROOT/$relative_path" >&2
         exit 1

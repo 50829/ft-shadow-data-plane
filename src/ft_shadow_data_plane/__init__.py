@@ -1,3 +1,3 @@
 """Loss-explicit market-data collection and reconstruction."""
 
-__version__ = "0.3.6"
+__version__ = "0.3.7"

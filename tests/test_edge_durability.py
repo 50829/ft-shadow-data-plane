@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time as wall_time
 from datetime import UTC, date, datetime, time, timedelta
@@ -64,12 +65,14 @@ async def test_queue_boundary_rotation_and_exact_ack(tmp_path: Path) -> None:
     wrong = AckV1(chunk_id=first["chunk_id"], sha256=HASH_A, durable_at=datetime.now(UTC))
     ack_path = tmp_path / "control/acks" / f"{first['chunk_id']}.ack.json"
     atomic_write_bytes(ack_path, canonical_json_bytes(wrong))
-    assert spool.apply_acks() == 0
+    rejected = spool.apply_acks()
+    assert rejected.applied == 0
+    assert rejected.hash_mismatches == 1
     assert (tmp_path / "ready" / first["data_path"]).exists()
 
     exact = AckV1(chunk_id=first["chunk_id"], sha256=first["sha256"], durable_at=datetime.now(UTC))
     atomic_write_bytes(ack_path, canonical_json_bytes(exact))
-    assert spool.apply_acks() == 1
+    assert spool.apply_acks().applied == 1
     assert not (tmp_path / "ready" / first["data_path"]).exists()
     chunk_date = date.fromisoformat(first["utc_date"])
     sealed = await day_index.seal(
@@ -89,7 +92,7 @@ async def test_queue_boundary_rotation_and_exact_ack(tmp_path: Path) -> None:
             )
         ),
     )
-    assert spool.apply_acks() == 1
+    assert spool.apply_acks().applied == 1
     assert not (tmp_path / "control/acked-manifests" / f"date={chunk_date}").exists()
 
 
@@ -119,7 +122,119 @@ def test_spool_skips_manifest_scan_when_there_are_no_acks(tmp_path: Path) -> Non
     malformed.parent.mkdir(parents=True)
     malformed.write_bytes(b"not-json")
 
-    assert spool.apply_acks() == 0
+    assert spool.apply_acks().seen == 0
+
+
+def test_spool_quarantines_malformed_ack_without_blocking_valid_ack(tmp_path: Path) -> None:
+    data = b"durable chunk"
+    relative = "date=2026-08-10/writer=depth/chunk-valid.parquet"
+    manifest = ChunkManifestV1(
+        chunk_id="chunk-valid",
+        data_path=relative,
+        sha256=__import__("hashlib").sha256(data).hexdigest(),
+        size_bytes=len(data),
+        content_type="application/vnd.apache.parquet",
+        collector_id="tokyo01",
+        writer_group=WriterGroup.DEPTH,
+        utc_date=date(2026, 8, 10),
+        event_count=1,
+        min_app_receive_realtime_ns=1,
+        max_app_receive_realtime_ns=1,
+        data_contract_hash=HASH_A,
+        universe_hash=HASH_A,
+        created_at=datetime(2026, 8, 10, tzinfo=UTC),
+    )
+    data_path = tmp_path / "ready" / relative
+    atomic_write_bytes(data_path, data)
+    atomic_write_bytes(
+        data_path.with_suffix(".manifest.json"), canonical_json_bytes(manifest)
+    )
+    ack_root = tmp_path / "control/acks"
+    atomic_write_bytes(ack_root / "a-malformed.ack.json", b"not-json")
+    atomic_write_bytes(
+        ack_root / "chunk-valid.ack.json",
+        canonical_json_bytes(
+            AckV1(
+                chunk_id=manifest.chunk_id,
+                sha256=manifest.sha256,
+                durable_at=datetime.now(UTC),
+            )
+        ),
+    )
+    spool = SpoolManager(tmp_path, max_bytes=10**9, minimum_free_bytes=0)
+    spool.initialize()
+
+    result = spool.apply_acks()
+
+    assert result.applied == 1
+    assert result.invalid == 1
+    assert not data_path.exists()
+    assert not any(ack_root.iterdir())
+    assert len(tuple((tmp_path / "control/rejected-acks").glob("*.rejected"))) == 1
+
+
+def test_spool_recovers_gc_transaction_after_audit_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = b"durable chunk"
+    relative = "date=2026-08-10/writer=depth/chunk-recovery.parquet"
+    manifest = ChunkManifestV1(
+        chunk_id="chunk-recovery",
+        data_path=relative,
+        sha256=__import__("hashlib").sha256(data).hexdigest(),
+        size_bytes=len(data),
+        content_type="application/vnd.apache.parquet",
+        collector_id="tokyo01",
+        writer_group=WriterGroup.DEPTH,
+        utc_date=date(2026, 8, 10),
+        event_count=1,
+        min_app_receive_realtime_ns=1,
+        max_app_receive_realtime_ns=1,
+        data_contract_hash=HASH_A,
+        universe_hash=HASH_A,
+        created_at=datetime(2026, 8, 10, tzinfo=UTC),
+    )
+    data_path = tmp_path / "ready" / relative
+    atomic_write_bytes(data_path, data)
+    atomic_write_bytes(
+        data_path.with_suffix(".manifest.json"), canonical_json_bytes(manifest)
+    )
+    atomic_write_bytes(
+        tmp_path / "control/acks/chunk-recovery.ack.json",
+        canonical_json_bytes(
+            AckV1(
+                chunk_id=manifest.chunk_id,
+                sha256=manifest.sha256,
+                durable_at=datetime.now(UTC),
+            )
+        ),
+    )
+    spool = SpoolManager(tmp_path, max_bytes=10**9, minimum_free_bytes=0)
+    spool.initialize()
+    original_append = spool.transfer_journal.append
+
+    def fail_audit(_events: object) -> int:
+        raise OSError("simulated audit filesystem failure")
+
+    monkeypatch.setattr(spool.transfer_journal, "append", fail_audit)
+    with pytest.raises(OSError, match="simulated audit filesystem failure"):
+        spool.apply_acks()
+
+    assert not data_path.exists()
+    assert len(tuple((tmp_path / "control/applying-acks").glob("*.transaction.json"))) == 1
+    monkeypatch.setattr(spool.transfer_journal, "append", original_append)
+
+    recovered = spool.apply_acks()
+
+    assert recovered.applied == 1
+    assert recovered.recovered == 1
+    assert not any((tmp_path / "control/applying-acks").iterdir())
+    events = [
+        json.loads(line)
+        for path in (tmp_path / "control/transfer-ledger").rglob("events.jsonl")
+        for line in path.read_text(encoding="ascii").splitlines()
+    ]
+    assert any(event["event"] == "REMOTE_GC" and event["recovered"] for event in events)
 
 
 @pytest.mark.asyncio

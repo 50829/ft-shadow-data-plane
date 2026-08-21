@@ -91,6 +91,7 @@ def test_vultr_config_is_formal_sixty_and_memory_bounded() -> None:
     assert max(shard_sizes) <= 18
     assert (max(shard_sizes) - 1) * config.snapshot_request_interval_seconds <= 34
     assert config.queue_max_bytes == 64 * 1024**2
+    assert config.minimum_free_bytes == 2 * 1024**3
     assert config.websocket_max_queue == 4
     assert config.writer_batch_bytes == 2 * 1024**2
     assert "mem_limit: 768m" in compose
@@ -164,6 +165,8 @@ def test_campus_installer_uses_hash_named_release(tmp_path: Path) -> None:
     assert active_release.resolve() == versioned_release
     assert (install_root / "ft-shadow-data-plane.sandbox").is_symlink()
     assert os.access(install_root / "pull-once.sh", os.X_OK)
+    assert (install_root / "status").is_dir()
+    assert (install_root / "data/transfer-ledger").is_dir()
     assert (install_root / "central.yaml").is_file()
     assert (install_root / "deploy/campus-107/processing.env").is_file()
 

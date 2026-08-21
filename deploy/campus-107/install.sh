@@ -27,9 +27,11 @@ install -d -m 750 \
     "$install_root" \
     "$install_root/logs" \
     "$install_root/rsync" \
+    "$install_root/status" \
     "$install_root/symbols" \
     "$data_root/raw" \
     "$data_root/derived" \
+    "$data_root/transfer-ledger" \
     "$deploy_root/slurm"
 release_hash=$(sha256sum "$release_sif" | cut -d' ' -f1)
 release_name=ft-shadow-data-plane-$release_hash.sif

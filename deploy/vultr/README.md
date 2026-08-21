@@ -1,6 +1,6 @@
 # Vultr 正式采集部署
 
-本手册适用于 `167.179.115.243` 上的 v0.3.6 collector。数据根为
+本手册适用于 `167.179.115.243` 上的 v0.3.7 collector。数据根为
 `/srv/ft-data-rsync`，collector 和受限传输账户都使用 UID/GID 10001。
 
 ## 1. 前置条件
@@ -19,7 +19,7 @@ timedatectl status
 
 ## 2. 安装目录和服务
 
-在 v0.3.6 仓库根目录执行：
+在 v0.3.7 仓库根目录执行：
 
 ```bash
 sudo ./deploy/vultr/install.sh
@@ -31,6 +31,9 @@ sudo ./deploy/vultr/install.sh
 /srv/ft-data-rsync/ready
 /srv/ft-data-rsync/writing
 /srv/ft-data-rsync/control/acks
+/srv/ft-data-rsync/control/applying-acks
+/srv/ft-data-rsync/control/rejected-acks
+/srv/ft-data-rsync/control/transfer-ledger
 /srv/ft-data-rsync/control/universe
 /etc/ft-shadow-data-plane/edge.yaml
 /etc/ft-shadow-data-plane/edge.env
@@ -69,7 +72,7 @@ ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
 
 ## 4. 配置正式 60 币和镜像
 
-`/etc/ft-shadow-data-plane/edge.yaml` 必须使用仓库 v0.3.6 示例。核对三个角色为 50/5/5、
+`/etc/ft-shadow-data-plane/edge.yaml` 必须使用仓库 v0.3.7 示例。核对三个角色为 50/5/5、
 `bootstrap_evidence_sha256` 与正式报告一致、`automation_enabled: true`、public shards 为 4，
 queue 为 64MiB。不要加入旧字段。
 
@@ -93,7 +96,7 @@ docker image inspect "$EDGE_IMAGE" --format '{{json .RepoDigests}}'
 
 Compose 已固定 0.90 CPU、768MiB RAM、256 PIDs、只读 rootfs 和日志轮换。
 
-## 5. v0.3.6 clean start
+## 5. v0.3.7 clean start
 
 只有在 collector 已停止、107 已经拉到 `new_chunks=0 failures=0`，且旧 control/evidence/gap tar
 已传到 107 并通过 SHA-256 校验后执行。Vultr 容量不足以长期保留第二份 spool，因此远端 active
@@ -168,6 +171,8 @@ docker inspect ft-shadow-data-plane-collector-1 \
 df -h /srv/ft-data-rsync
 find /srv/ft-data-rsync/ready -type f | wc -l
 find /srv/ft-data-rsync/control/acks -type f | wc -l
+sudo jq . /srv/ft-data-rsync/control/transfer-status.json
+sudo find /srv/ft-data-rsync/control/rejected-acks -maxdepth 1 -type f -print
 journalctl -u ft-shadow-data-plane.service --since '24 hours ago' \
   | grep -E 'GAP|collector status|FORMAL_COLLECTION_STARTED|planned universe'
 ```
@@ -197,7 +202,7 @@ sudo find /srv/ft-data-rsync/control/open-gaps -type f -maxdepth 1 -print
 
 每分钟 collector status 日志包含 RSS、Arrow bytes、CPU time、steal、event-loop lag、queue
 ratio、writer idle 和 finalize 时间。按照 [实施合同](../../docs/implementation-plan.md) 计算
-p95/p99。若 OOM、RSS 峰值超过 700MiB、CPU p95 超过 80%、queue 连续过高、磁盘低于 5GiB
+p95/p99。若 OOM、RSS 峰值超过 700MiB、CPU p95 超过 80%、queue 连续过高、磁盘低于 2GiB
 或出现性能 gap，不得通过减少 60 币或降低频率规避；应先停止并扩容或优化。
 
 ## 9. 升级
@@ -243,3 +248,8 @@ collector status 周期，并确认 ready chunk 和 107 ACK 均持续推进。10
 
 从 v0.3.5 升级 v0.3.6 不改变 edge 配置、raw 或 universe 合同。107 必须升级，以避免每分钟 pull
 对字节完全一致、已经发布的历史 `SEALED.json` 重复哈希全部 chunk；某日第一次发布仍执行完整校验。
+
+从 v0.3.6 升级 v0.3.7 必须同时升级 107 和 Vultr，但不删除 raw、ready、ACK、universe 或 gap。
+新 edge 首先应用遗留 ACK，再启动 sources；新 central 自动创建 transfer ledger 和 status 目录。
+升级后要求连续两次 107 `state=ok`，Vultr `transactions_pending=0`、`hash_mismatches=0`，并确认
+`REMOTE_GC` 持续出现。磁盘保护线使用 `minimum_free_bytes: 2147483648`。

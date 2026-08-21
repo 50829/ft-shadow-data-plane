@@ -23,10 +23,10 @@ module -t avail 2>&1 | grep apptainer
 command -v crontab flock sbatch ssh
 ```
 
-新装时使用 v0.3.6 的仓库目录、`ft-shadow-data-plane.sif`、对应 SHA-256 文件，以及 Vultr 已授权的
+新装时使用 v0.3.7 的仓库目录、`ft-shadow-data-plane.sif`、对应 SHA-256 文件，以及 Vultr 已授权的
 `~/.ssh/ft-data-puller` 私钥。
 
-v0.3.6 只支持当前结构化 universe 合同，不解析旧 generation。旧 raw/runtime 原地移动到
+v0.3.7 只支持当前结构化 universe 合同，不解析旧 generation。旧 raw/runtime 原地移动到
 `data/archive/pre-v0.3.5-*`，不删除；新 runtime/raw/derived 从空路径部署，禁止把旧文件混入新日期。
 
 ## 2. 归档旧实验并 clean start
@@ -76,7 +76,7 @@ mkdir -p "$BASE/data/raw" "$BASE/data/derived"
 新代码不扫描 `$BASE/data/archive`。旧数据需要旧版离线环境时，必须显式指向该 archive；不得把它
 链接回新的 `data/raw` 或 runtime。
 
-## 3. 校验并安装 v0.3.6
+## 3. 校验并安装 v0.3.7
 
 ```bash
 cd /home/scc/pb24000367/Projects/bn/ft-shadow-data-plane
@@ -173,7 +173,8 @@ FT_CAMPUS_ROOT=/home/scc/pb24000367/Projects/bn/runtime \
 成功日志类似：
 
 ```text
-pull complete new_chunks=<n> failures=0
+pull complete run_id=<id> remote_manifests=<n> new_chunks=<n> existing_verified=<n> \
+verified_bytes=<n> acks_queued=<n> acks_pushed=<n> failures=0 duration_seconds=<n>
 ```
 
 检查永久数据而不是暂存目录：
@@ -186,6 +187,18 @@ find /home/scc/pb24000367/Projects/bn/data/raw \
 ```
 
 Vultr 上对应 chunk 的 ACK 到达后才会删除 ready 副本。
+
+检查 107 的持久传输状态和审计日志：
+
+```bash
+jq . /home/scc/pb24000367/Projects/bn/runtime/status/last-pull.json
+LEDGER_DATE=$(date -u +%F)
+tail -n 20 "/home/scc/pb24000367/Projects/bn/data/transfer-ledger/date=$LEDGER_DATE/events.jsonl"
+```
+
+`state=ok` 且 `acks_pushed=acks_queued` 证明 107 已完成本地持久化和 ACK 回传；端到端确认还要
+在 Vultr 看到对应 `REMOTE_GC`。完整语义见
+[ACK 传输审计合同](../../docs/transfer-ack-observability.md)。
 
 ## 7. 安装 cron
 

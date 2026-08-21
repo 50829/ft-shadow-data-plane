@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 from ft_shadow_data_plane.contracts.models import GapReason, StreamType
 from ft_shadow_data_plane.edge.service import EdgeService
-from ft_shadow_data_plane.edge.spool import SpoolStatus
+from ft_shadow_data_plane.edge.spool import AckApplyResult, SpoolStatus
 
 
 class OnlineSources:
@@ -55,8 +55,8 @@ class StorageSpool:
         self._status = status
         self._stop = stop
 
-    def apply_acks(self) -> int:
-        return 0
+    def apply_acks(self) -> AckApplyResult:
+        return AckApplyResult()
 
     def status(self) -> SpoolStatus:
         self._stop.set()

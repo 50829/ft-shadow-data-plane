@@ -1,4 +1,4 @@
-# v0.3.6 正式采集实施合同
+# v0.3.7 正式采集实施合同
 
 ## 本阶段目标
 
@@ -110,6 +110,10 @@ ticker 响应的 SHA-256。该事件时间之后的数据属于正式实验。24
 4. 生成 ACK 并 rsync 到 Vultr `control/acks/`；
 5. Vultr 只有在 ACK 的 chunk ID 和 SHA-256 都匹配后才删除 ready 数据。
 
+两端必须持久记录 `LOCAL_DURABLE`、`ACK_PUSHED`、`ACK_VALIDATED` 和 `REMOTE_GC`；Vultr 删除
+ready 前必须先写可恢复 transaction。损坏、未知或 hash 冲突 ACK 只能隔离和报警，不能删除 ready
+或终止全部采集。详细合同见 [ACK 传输审计](transfer-ack-observability.md)。
+
 禁止使用 `--remove-source-files`。暂存镜像不是永久数据，下一次同步可删除已从 Vultr GC 的
 镜像文件；`data/raw` 才是 107 上的永久原始数据。
 
@@ -127,7 +131,7 @@ ticker 响应的 SHA-256。该事件时间之后的数据属于正式实验。24
 - queue p99 小于 50%，不得连续 10 秒超过 70%；
 - Parquet finalize p99 小于 5 秒；
 - 24 小时内无性能原因 gap，ACK 通常小于 3 分钟；
-- 磁盘可用空间至少 5GiB。
+- 磁盘可用空间至少 2GiB。
 
 首次 24 小时只做观察和判定。任何硬指标失败都应扩容或优化实现，不得改变 60 币正式合同。
 

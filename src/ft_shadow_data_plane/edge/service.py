@@ -29,7 +29,7 @@ from ft_shadow_data_plane.edge.ingest import IngestCoordinator
 from ft_shadow_data_plane.edge.lease import CollectorLease
 from ft_shadow_data_plane.edge.queue import ByteBoundedQueues
 from ft_shadow_data_plane.edge.sources import SourceManager
-from ft_shadow_data_plane.edge.spool import SpoolManager
+from ft_shadow_data_plane.edge.spool import AckApplyResult, SpoolManager
 from ft_shadow_data_plane.edge.universe import UniverseStore
 from ft_shadow_data_plane.edge.writer import ChunkLimits, WriterPool
 
@@ -112,6 +112,8 @@ class EdgeService:
 
     async def run(self) -> None:
         self._spool.initialize()
+        initial_acks = await asyncio.to_thread(self._spool.apply_acks)
+        self._log_ack_result(initial_acks)
         self._gaps.initialize()
         recovery_start_ns = await asyncio.to_thread(self._lease.recovery_start_ns)
         if recovery_start_ns is not None:
@@ -179,10 +181,9 @@ class EdgeService:
         while not self._stop.is_set():
             async with self._operation_lock:
                 self._sources.raise_if_failed()
-                removed = await asyncio.to_thread(self._spool.apply_acks)
+                ack_result = await asyncio.to_thread(self._spool.apply_acks)
                 status = await asyncio.to_thread(self._spool.status)
-                if removed:
-                    logger.info("garbage-collected ACKed chunks count=%d", removed)
+                self._log_ack_result(ack_result)
                 if status.hard_limited:
                     if self._storage_gap_id is None:
                         self._storage_gap_id = await self._gaps.open(
@@ -220,6 +221,39 @@ class EdgeService:
                         )
                         self._storage_gap_id = None
             await _wait_event(self._stop, self._config.storage_check_seconds)
+
+    @staticmethod
+    def _log_ack_result(result: AckApplyResult) -> None:
+        if not (
+            result.seen
+            or result.applied
+            or result.invalid
+            or result.hash_mismatches
+            or result.unknown
+            or result.manifest_errors
+        ):
+            return
+        level = (
+            logging.ERROR
+            if result.invalid
+            or result.hash_mismatches
+            or result.unknown
+            or result.manifest_errors
+            else logging.INFO
+        )
+        logger.log(
+            level,
+            "ack apply complete seen=%d applied=%d gc_bytes=%d invalid=%d "
+            "hash_mismatches=%d unknown=%d manifest_errors=%d recovered=%d",
+            result.seen,
+            result.applied,
+            result.gc_bytes,
+            result.invalid,
+            result.hash_mismatches,
+            result.unknown,
+            result.manifest_errors,
+            result.recovered,
+        )
 
     async def _midnight_loop(self) -> None:
         while not self._stop.is_set():

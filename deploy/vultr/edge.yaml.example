@@ -128,7 +128,7 @@ chunk_max_events: 1000000
 writer_batch_events: 2000
 writer_batch_bytes: 2097152
 spool_max_bytes: 10737418240
-minimum_free_bytes: 5368709120
+minimum_free_bytes: 2147483648
 storage_check_seconds: 5
 d0_enabled: false
 log_level: INFO

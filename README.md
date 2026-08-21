@@ -1,6 +1,6 @@
 # ft-shadow-data-plane
 
-Binance USD-M 正式数据采集与重建流水线。v0.3.6 持续采集 60 个合约：
+Binance USD-M 正式数据采集与重建流水线。v0.3.7 持续采集 60 个合约：
 50 core、5 boundary、5 probe。
 
 ```text
@@ -64,3 +64,8 @@ storage gap OPEN、清理半启动 sources，并在下一轮重试。旧 generat
 v0.3.6 避免 107 每分钟对已经发布且 manifest 完全一致的历史 sealed day 重复扫描全部 raw
 SHA-256。某日首次发布时仍逐 chunk 校验，远端 sealed manifest 冲突仍 fail closed；该补丁不改变
 edge、raw、universe 或正式 60 币身份。
+
+v0.3.7 为 107 与 Vultr 增加持久 ACK transfer ledger 和原子状态快照；Vultr 使用可恢复 transaction
+保护 ready GC，损坏、未知或 hash 冲突 ACK 被隔离，不再终止 collector 或触发重复全量扫描。
+central 同时拒绝不安全 `collector_id`，磁盘最小可用空间保护线调整为 2 GiB。详见
+[ACK 传输审计合同](docs/transfer-ack-observability.md)。
